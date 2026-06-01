@@ -66,3 +66,23 @@ python t2s_doc_watcher.py --check-only --verbose
 ```
 
 El watcher compara el Professional Use actual con el corpus procesado y, si se ejecuta sin `--check-only`, reconstruye con `t2s_ingest.py --refresh-index`.
+
+## Publicacion
+
+El repositorio debe contener solo codigo y configuracion. El corpus (`data/`), salidas (`output/`) y secretos (`secrets/`) se generan en cada entorno y estan ignorados por Git.
+
+Cuando exista `trilemmaconsulting/t2sgpt` y la cuenta tenga permiso de escritura:
+
+```powershell
+git remote add origin https://github.com/trilemmaconsulting/t2sgpt.git
+git push -u origin main
+```
+
+En produccion, tras clonar:
+
+```powershell
+python -m pip install -r requirements.txt
+python t2s_ingest.py --force
+python qa_t2s.py
+python t2s_web.py
+```
