@@ -71,10 +71,16 @@ El watcher compara el Professional Use actual con el corpus procesado y, si se e
 
 El repositorio debe contener solo codigo y configuracion. El corpus (`data/`), salidas (`output/`) y secretos (`secrets/`) se generan en cada entorno y estan ignorados por Git.
 
-Cuando exista `trilemmaconsulting/t2sgpt` y la cuenta tenga permiso de escritura:
+Repositorio publico del producto:
+
+```text
+https://github.com/jsmcel/t2sgpt
+```
+
+Para publicar desde este checkout:
 
 ```powershell
-git remote add origin https://github.com/trilemmaconsulting/t2sgpt.git
+git remote add origin https://github.com/jsmcel/t2sgpt.git
 git push -u origin main
 ```
 
