@@ -51,6 +51,17 @@ QUESTIONS = [
         "must_contain_any": ["sese", "message", "schema", "iso"],
         "min_citations": 1,
     },
+    {
+        "id": "message-sese-023-definition",
+        "question": "Que es un sese.023?",
+        "must_contain_any": [
+            "securities settlement transaction instruction",
+            "instruccion de liquidacion",
+            "ciclo operativo",
+        ],
+        "must_not_contain_any": ["pasajes locales", "revisaria primero"],
+        "min_citations": 1,
+    },
 ]
 
 
@@ -59,8 +70,9 @@ def run_case(case: dict) -> dict:
     text = str(payload.get("answer") or "").lower()
     citations = payload.get("citations") or []
     contains = any(term.lower() in text for term in case.get("must_contain_any", []))
+    avoids_forbidden_terms = not any(term.lower() in text for term in case.get("must_not_contain_any", []))
     enough_citations = len(citations) >= int(case.get("min_citations", 0))
-    ok = contains and enough_citations and payload.get("confidence") != "low"
+    ok = contains and avoids_forbidden_terms and enough_citations and payload.get("confidence") != "low"
     return {
         "id": case["id"],
         "question": case["question"],
@@ -68,6 +80,7 @@ def run_case(case: dict) -> dict:
         "confidence": payload.get("confidence"),
         "citations": len(citations),
         "contains_expected_term": contains,
+        "avoids_forbidden_terms": avoids_forbidden_terms,
         "answer_excerpt": str(payload.get("answer") or "")[:800],
     }
 
