@@ -458,6 +458,7 @@ def normalize_query(query: str) -> str:
     for key, value in replacements.items():
         if key in low:
             expanded.append(value)
+    expanded.extend(fuzzy_known_term_expansions(query))
     for code in query_message_codes(query):
         expanded.append(code)
         expanded.append(code.replace(".", "_"))
@@ -582,6 +583,52 @@ def query_content_terms(query: str) -> list[str]:
     return terms
 
 
+def _fuzzy_cutoff(term: str) -> float:
+    if len(term) >= 8:
+        return 0.78
+    if len(term) >= 6:
+        return 0.82
+    return 0.9
+
+
+def _fuzzy_contains_term(term: str, hay_terms: set[str] | frozenset[str]) -> bool:
+    if len(term) < 5:
+        return False
+    cutoff = _fuzzy_cutoff(term)
+    for candidate in hay_terms:
+        if abs(len(candidate) - len(term)) > max(2, len(term) // 3):
+            continue
+        if _similarity(term, candidate) >= cutoff:
+            return True
+    return False
+
+
+def fuzzy_known_term_expansions(query: str) -> list[str]:
+    terms = query_content_terms(query)
+    expansions: list[str] = []
+    for candidate_key, candidate in TERM_DEFINITIONS.items():
+        for trigger in candidate.get("triggers", []):
+            trigger_norm = _normalize_easter_text(trigger)
+            if " " in trigger_norm or len(trigger_norm) < 5:
+                continue
+            for term in terms:
+                if len(term) < 5:
+                    continue
+                if abs(len(term) - len(trigger_norm)) > max(2, len(trigger_norm) // 3):
+                    continue
+                if _similarity(term, trigger_norm) >= _fuzzy_cutoff(trigger_norm):
+                    expansions.append(
+                        " ".join(
+                            str(candidate.get(key) or "")
+                            for key in ("name", "short_en", "short_es", "role_en", "role_es", "flow_en", "flow_es")
+                        )
+                    )
+                    expansions.append(candidate_key)
+                    expansions.extend(str(item) for item in candidate.get("triggers", []))
+                    break
+    return expansions
+
+
 def has_domain_evidence(query: str, hits: list[Hit]) -> bool:
     if not hits or hits[0].score < DOMAIN_EVIDENCE_SCORE_THRESHOLD:
         return False
@@ -595,6 +642,8 @@ def has_domain_evidence(query: str, hits: list[Hit]) -> bool:
         hay = _normalize_easter_text(_chunk_text_for_ranking(hit.chunk))
         matched_terms = [term for term in terms if term in hay]
         if matched_terms:
+            return True
+        if any(_fuzzy_contains_term(term, _domain_terms_from_text(hay)) for term in terms):
             return True
     return False
 
@@ -655,6 +704,8 @@ def is_index_domain_query(query: str, index_path: str = str(INDEX_PATH)) -> bool
         return False
     lexicon = load_domain_lexicon(index_path)
     if any(term in lexicon for term in terms):
+        return True
+    if any(_fuzzy_contains_term(term, lexicon) for term in terms):
         return True
     for size in (2, 3):
         for start in range(0, max(0, len(terms) - size + 1)):
@@ -850,6 +901,24 @@ def build_term_answer(query: str, hits: list[Hit], language: str = "es") -> dict
             key = candidate_key
             definition = candidate
             break
+    if not definition:
+        terms = query_content_terms(query)
+        best: tuple[float, str, dict[str, Any]] | None = None
+        for candidate_key, candidate in TERM_DEFINITIONS.items():
+            for trigger in candidate.get("triggers", []):
+                trigger_norm = _normalize_easter_text(trigger)
+                if " " in trigger_norm:
+                    continue
+                for term in terms:
+                    if len(term) < 5 or len(trigger_norm) < 5:
+                        continue
+                    if abs(len(term) - len(trigger_norm)) > max(2, len(trigger_norm) // 3):
+                        continue
+                    score = _similarity(term, trigger_norm)
+                    if score >= _fuzzy_cutoff(trigger_norm) and (best is None or score > best[0]):
+                        best = (score, candidate_key, candidate)
+        if best:
+            _, key, definition = best
     if not definition:
         return None
     citations = citations_from_hits(hits[: min(4, len(hits))])
