@@ -33,6 +33,7 @@ MODEL_PRESETS = {
 GENERATION_CONTEXT_HITS = 24
 GENERATION_RETRIEVAL_HITS = 40
 MAX_CONTEXT_HITS = 64
+DOMAIN_EVIDENCE_SCORE_THRESHOLD = 0.18
 RELEASE_RE = re.compile(r"R(20\d{2})[._ -]?(NOV|OCT|JUN|MAR)", re.I)
 MESSAGE_RE = re.compile(r"\b(acmt|admi|camt|pacs|reda|semt|sese|seev)\.(\d{3})(?:\.(\d{3}))?\b", re.I)
 ACRONYM_RE = re.compile(r"\b[A-Z0-9]{2,12}\b")
@@ -98,6 +99,31 @@ QUESTION_STOPWORDS = {
     "what",
     "which",
     "y",
+}
+DOMAIN_LEXICON_STOPWORDS = QUESTION_STOPWORDS | {
+    "all",
+    "also",
+    "annex",
+    "chapter",
+    "clean",
+    "document",
+    "documents",
+    "english",
+    "from",
+    "general",
+    "html",
+    "index",
+    "page",
+    "pages",
+    "part",
+    "pdf",
+    "release",
+    "shared",
+    "table",
+    "target",
+    "target2",
+    "version",
+    "with",
 }
 FAMILY_HINTS = {
     "t2s_sdd": ["sdd", "scope defining", "scope", "legal basis", "service description"],
@@ -304,6 +330,16 @@ TERM_DEFINITIONS = {
         "flow_es": "La liquidacion comprueba disponibilidad de valores y de efectivo; la DCA participa en esa comprobacion y movimiento de efectivo.",
         "flow_en": "Settlement checks securities and cash availability; the DCA is involved in that cash check and movement.",
     },
+    "allegement": {
+        "triggers": ["allegement", "allegements", "allgmt", "sctiessttlmtxallgmt", "notificacion de allegement", "notificación de allegement"],
+        "name": "Allegement",
+        "short_es": "una alerta de matching: T2S informa de que existe una instruccion de una parte y falta, no llega o no casa la instruccion de la contrapartida",
+        "short_en": "a matching alert: T2S informs that one party's instruction exists and the counterparty instruction is missing, not received or not matched",
+        "role_es": "Sirve para avisar a la posible contrapartida de que debe revisar o introducir su instruccion para que la operacion pueda casar.",
+        "role_en": "It alerts the possible counterparty that it should review or enter its instruction so the transaction can match.",
+        "flow_es": "En el flujo T2S suele vincularse a `sese.028` como notificacion de allegement; si deja de aplicar, T2S lo retira con mensajes como `sese.029`.",
+        "flow_en": "In the T2S flow it is typically linked to `sese.028` as allegement notification; when it no longer applies, T2S removes it with messages such as `sese.029`.",
+    },
     "change_request": {
         "triggers": ["change request", "change requests", "cr ", "crs", "release"],
         "name": "Change Request",
@@ -412,6 +448,8 @@ def normalize_query(query: str) -> str:
         "dcp": "directly connected party participant connectivity",
         "autocolateralizacion": "auto-collateralisation auto collateralisation",
         "autocolateralización": "auto-collateralisation auto collateralisation",
+        "allegement": "allegement matching counterparty instruction sese.028 sese.029 semt.019",
+        "allegements": "allegement matching counterparty instruction sese.028 sese.029 semt.019",
     }
     tokens = re.findall(r"[\w./-]+", query, flags=re.UNICODE)
     cleaned = " ".join(token for token in tokens if token.lower() not in QUESTION_STOPWORDS)
@@ -476,6 +514,9 @@ def is_domain_query(query: str) -> bool:
         "matching",
         "partial settlement",
         "corporate action",
+        "allegement",
+        "allegements",
+        "allgmt",
         "liquidacion",
         "liquidación",
         "valores",
@@ -528,6 +569,98 @@ def _chunk_text_for_ranking(chunk: dict[str, Any]) -> str:
             "text",
         ]
     )
+
+
+def query_content_terms(query: str) -> list[str]:
+    normalized = _normalize_easter_text(query)
+    terms: list[str] = []
+    for term in re.findall(r"[a-z0-9./-]{3,}", normalized):
+        if term in QUESTION_STOPWORDS:
+            continue
+        if term not in terms:
+            terms.append(term)
+    return terms
+
+
+def has_domain_evidence(query: str, hits: list[Hit]) -> bool:
+    if not hits or hits[0].score < DOMAIN_EVIDENCE_SCORE_THRESHOLD:
+        return False
+    terms = query_content_terms(query)
+    if not terms:
+        return False
+    top_hits = hits[: min(8, len(hits))]
+    for hit in top_hits:
+        if hit.score < DOMAIN_EVIDENCE_SCORE_THRESHOLD:
+            continue
+        hay = _normalize_easter_text(_chunk_text_for_ranking(hit.chunk))
+        matched_terms = [term for term in terms if term in hay]
+        if matched_terms:
+            return True
+    return False
+
+
+def _domain_terms_from_text(text: str) -> set[str]:
+    normalized = _normalize_easter_text(text)
+    tokens = [
+        token
+        for token in re.findall(r"[a-z0-9]{3,}", normalized)
+        if token not in DOMAIN_LEXICON_STOPWORDS and not token.isdigit()
+    ]
+    terms: set[str] = set(tokens)
+    for size in (2, 3):
+        for start in range(0, max(0, len(tokens) - size + 1)):
+            phrase = " ".join(tokens[start : start + size])
+            if len(phrase) <= 80:
+                terms.add(phrase)
+    return terms
+
+
+def _metadata_text(item: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("title", "category", "family", "release", "unit_type", "unit", "local_path", "source_url"):
+        value = item.get(key)
+        if value:
+            parts.append(str(value))
+    context_path = item.get("context_path")
+    if isinstance(context_path, list):
+        parts.extend(str(part) for part in context_path if part)
+    elif context_path:
+        parts.append(str(context_path))
+    return " ".join(parts)
+
+
+@lru_cache(maxsize=2)
+def load_domain_lexicon(index_path: str = str(INDEX_PATH)) -> frozenset[str]:
+    index = load_index(Path(index_path))
+    terms: set[str] = set()
+    for doc in index.get("docs") or []:
+        if isinstance(doc, dict):
+            terms.update(_domain_terms_from_text(_metadata_text(doc)))
+    seen_docs: set[str] = set()
+    for chunk in index.get("chunks") or []:
+        if not isinstance(chunk, dict):
+            continue
+        doc_id = str(chunk.get("doc_id") or "")
+        if doc_id and doc_id in seen_docs:
+            continue
+        if doc_id:
+            seen_docs.add(doc_id)
+        terms.update(_domain_terms_from_text(_metadata_text(chunk)))
+    return frozenset(terms)
+
+
+def is_index_domain_query(query: str, index_path: str = str(INDEX_PATH)) -> bool:
+    terms = query_content_terms(query)
+    if not terms:
+        return False
+    lexicon = load_domain_lexicon(index_path)
+    if any(term in lexicon for term in terms):
+        return True
+    for size in (2, 3):
+        for start in range(0, max(0, len(terms) - size + 1)):
+            if " ".join(terms[start : start + size]) in lexicon:
+                return True
+    return False
 
 
 def metadata_bonus(chunk: dict[str, Any], query: str) -> float:
@@ -866,8 +999,8 @@ def build_message_answer(query: str, hits: list[Hit], language: str = "es") -> d
     return {"answer": answer, "citations": citations, "confidence": "high", "answer_type": "message_definition"}
 
 
-def build_answer(query: str, hits: list[Hit], language: str = "es") -> dict[str, Any]:
-    if not is_domain_query(query):
+def build_answer(query: str, hits: list[Hit], language: str = "es", corpus_domain: bool = False) -> dict[str, Any]:
+    if not is_domain_query(query) and not corpus_domain and not has_domain_evidence(query, hits):
         msg = (
             "I cannot see a T2S term, message, acronym, release or process in that question. Ask with the specific T2S concept and I will answer from the local corpus."
             if language == "en"
@@ -1113,8 +1246,9 @@ def answer_question(
     search_query = retrieval_query or query
     if model_preset == "local_rag":
         generate = False
+    corpus_domain = is_index_domain_query(query)
     hits = _retrieve_context(search_query, top_k=top_k, generate=generate)
-    payload = build_answer(query, hits, language=resolved_language)
+    payload = build_answer(query, hits, language=resolved_language, corpus_domain=corpus_domain)
     if generate and hits and payload.get("confidence") != "low":
         draft = payload.get("answer") or None
         generation_hits = prioritize_generation_hits(search_query, hits, max_hits=GENERATION_CONTEXT_HITS)
