@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import pickle
+import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -33,6 +36,13 @@ MAX_CONTEXT_HITS = 64
 RELEASE_RE = re.compile(r"R(20\d{2})[._ -]?(NOV|OCT|JUN|MAR)", re.I)
 MESSAGE_RE = re.compile(r"\b(acmt|admi|camt|pacs|reda|semt|sese|seev)\.(\d{3})(?:\.(\d{3}))?\b", re.I)
 ACRONYM_RE = re.compile(r"\b[A-Z0-9]{2,12}\b")
+EASTER_EGG_TRIGGER = "galleta vietnamita"
+EASTER_EGG_RESPONSES = (
+    "hay mucho rubio en suecia",
+    "hace frio en suecia",
+    "César Conesa",
+    "Didieur te llevara al eur",
+)
 
 SPANISH_LANGUAGE_HINTS = {
     "como",
@@ -317,6 +327,40 @@ class Hit:
     @property
     def citation(self) -> str:
         return cite_label(self)
+
+
+def _normalize_easter_text(text: str) -> str:
+    folded = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    folded = folded.lower()
+    folded = re.sub(r"[^a-z0-9]+", " ", folded)
+    return re.sub(r"\s+", " ", folded).strip()
+
+
+def _similarity(left: str, right: str) -> float:
+    return difflib.SequenceMatcher(None, left, right).ratio()
+
+
+def is_easter_egg_query(query: str) -> bool:
+    normalized = _normalize_easter_text(query)
+    target = _normalize_easter_text(EASTER_EGG_TRIGGER)
+    if not normalized:
+        return False
+    if target in normalized:
+        return True
+    compact = normalized.replace(" ", "")
+    target_compact = target.replace(" ", "")
+    if target_compact in compact:
+        return True
+    if len(normalized) <= len(target) + 8 and _similarity(normalized, target) >= 0.82:
+        return True
+    words = normalized.split()
+    for size in (2, 3):
+        for start in range(0, max(0, len(words) - size + 1)):
+            window = " ".join(words[start : start + size])
+            window_compact = window.replace(" ", "")
+            if max(_similarity(window, target), _similarity(window_compact, target_compact)) >= 0.78:
+                return True
+    return False
 
 
 def detect_question_language(query: str) -> str:
@@ -1054,6 +1098,18 @@ def answer_question(
     model_preset: str = "codex_high",
 ) -> dict[str, Any]:
     resolved_language = detect_question_language(query) if language == "auto" else language
+    if is_easter_egg_query(query):
+        return {
+            "answer": random.choice(EASTER_EGG_RESPONSES),
+            "citations": [],
+            "confidence": "high",
+            "answer_type": "easter_egg",
+            "generated_by": "easter_egg",
+            "question": query,
+            "language": resolved_language,
+            "model": model_preset,
+            "hits": [],
+        }
     search_query = retrieval_query or query
     if model_preset == "local_rag":
         generate = False
