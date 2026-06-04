@@ -128,7 +128,7 @@ DOMAIN_LEXICON_STOPWORDS = QUESTION_STOPWORDS | {
 FAMILY_HINTS = {
     "t2s_sdd": ["sdd", "scope defining", "scope", "legal basis", "service description"],
     "t2s_udfs": ["udfs", "functional specification", "message", "schema", "xsd", "xml"],
-    "t2s_uhb": ["uhb", "user handbook", "gui", "screen", "u2a", "user interface"],
+    "t2s_uhb": ["uhb", "user handbook", "gui", "screen", "u2a", "user interface", "business rule", "business rules"],
     "change_requests": ["change request", "cr", "crs", "release", "impact", "status"],
     "connectivity": ["connectivity", "esmig", "nsp", "swift", "message exchange", "technical"],
     "business_processes": ["business process", "bpd", "settlement", "matching", "lifecycle"],
@@ -290,8 +290,18 @@ TERM_DEFINITIONS = {
         "flow_es": "Complementa a la UDFS: la UDFS describe funcionalidad y mensajes; la UHB aterriza la experiencia de usuario.",
         "flow_en": "It complements the UDFS: UDFS describes functionality and messages; UHB describes the user experience.",
     },
+    "gfs": {
+        "triggers": ["gfs", "general functional specification", "general functional specifications"],
+        "name": "GFS",
+        "short_es": "la General Functional Specifications: la especificacion funcional general de T2S",
+        "short_en": "the General Functional Specifications: the general functional specification for T2S",
+        "role_es": "Da la vision funcional de alto nivel del servicio: procesos, servicios, restricciones y comportamiento general antes del detalle de UDFS/UHB.",
+        "role_en": "It gives the high-level functional view of the service: processes, services, constraints and general behaviour before UDFS/UHB detail.",
+        "flow_es": "Se usa como referencia funcional de base; para reglas de mensaje, campos y operativa fina se baja despues a UDFS, UHB, business rules y esquemas.",
+        "flow_en": "It is used as a baseline functional reference; message rules, fields and detailed operation are then handled in UDFS, UHB, business rules and schemas.",
+    },
     "udfs": {
-        "triggers": ["udfs", "user detailed functional specification", "functional specification"],
+        "triggers": ["udfs", "user detailed functional specification", "user detailed functional specifications"],
         "name": "UDFS",
         "short_es": "la User Detailed Functional Specification: la especificacion funcional detallada de T2S",
         "short_en": "the User Detailed Functional Specification: the detailed functional specification of T2S",
@@ -414,7 +424,9 @@ def load_index(path: Path = INDEX_PATH) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Index not found at {path}. Run `python t2s_ingest.py` first.")
     with path.open("rb") as fh:
-        return pickle.load(fh)
+        index = pickle.load(fh)
+    _prepare_runtime_index(index)
+    return index
 
 
 @lru_cache(maxsize=8)
@@ -433,7 +445,7 @@ def normalize_query(query: str) -> str:
         "conectividad": "connectivity ESMIG network service provider NSP",
         "pantallas": "UHB GUI screen user interface",
         "manual": "user handbook UHB",
-        "requisitos": "requirements specifications SDD UDFS",
+        "requisitos": "requirements specifications SDD GFS UDFS",
         "mensajes": "messages schemas ISO 20022",
         "mensaje": "message schema ISO 20022",
         "esquema": "schema xsd usage guideline",
@@ -446,10 +458,16 @@ def normalize_query(query: str) -> str:
         "dca": "dedicated cash account cash settlement",
         "csd": "central securities depository participant",
         "dcp": "directly connected party participant connectivity",
+        "gfs": "general functional specifications functional overview scope service",
         "autocolateralizacion": "auto-collateralisation auto collateralisation",
         "autocolateralización": "auto-collateralisation auto collateralisation",
         "allegement": "allegement matching counterparty instruction sese.028 sese.029 semt.019",
         "allegements": "allegement matching counterparty instruction sese.028 sese.029 semt.019",
+        "business rules": "business rules business rule UDFS UHB scope defining documents release annex",
+        "business rule": "business rules business rule UDFS UHB scope defining documents release annex",
+        "buisness": "business business rules business rule",
+        "busines": "business business rules business rule",
+        "busness": "business business rules business rule",
     }
     tokens = re.findall(r"[\w./-]+", query, flags=re.UNICODE)
     cleaned = " ".join(token for token in tokens if token.lower() not in QUESTION_STOPWORDS)
@@ -508,11 +526,14 @@ def is_domain_query(query: str) -> bool:
         "dca",
         "uhb",
         "udfs",
+        "gfs",
         "sdd",
         "esmig",
         "auto-collateralisation",
         "autocolateral",
         "matching",
+        "business rule",
+        "business rules",
         "partial settlement",
         "corporate action",
         "allegement",
@@ -522,7 +543,7 @@ def is_domain_query(query: str) -> bool:
         "liquidación",
         "valores",
     ]
-    return any(term in low for term in domain_terms) or any(acr in {"T2S", "CSD", "DCP", "DCA", "UDFS", "UHB", "SDD"} for acr in query_acronyms(query))
+    return any(term in low for term in domain_terms) or any(acr in {"T2S", "CSD", "DCP", "DCA", "UDFS", "UHB", "GFS", "SDD"} for acr in query_acronyms(query))
 
 
 def _bm25_scores(index: dict[str, Any], query: str) -> np.ndarray:
@@ -678,6 +699,51 @@ def _metadata_text(item: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def _prepare_runtime_index(index: dict[str, Any]) -> None:
+    for chunk in index.get("chunks") or []:
+        if not isinstance(chunk, dict):
+            continue
+        meta_norm = _normalize_easter_text(_metadata_text(chunk))
+        chunk["_metadata_norm"] = meta_norm
+        chunk["_title_norm"] = _normalize_easter_text(str(chunk.get("title") or ""))
+        if chunk.get("unit_type") == "document_metadata":
+            chunk["_metadata_terms"] = frozenset(_domain_terms_from_text(meta_norm))
+
+
+def metadata_prefilter_bonus(chunk: dict[str, Any], query: str) -> float:
+    query_norm = _normalize_easter_text(query)
+    meta_norm = str(chunk.get("_metadata_norm") or _normalize_easter_text(_metadata_text(chunk)))
+    title_norm = str(chunk.get("_title_norm") or _normalize_easter_text(str(chunk.get("title") or "")))
+    bonus = 0.0
+
+    if title_norm and (title_norm == query_norm or title_norm in query_norm or query_norm in title_norm):
+        bonus += 1.1
+
+    release = query_release(query)
+    if release and chunk.get("release") == release:
+        bonus += 0.35
+
+    terms = query_content_terms(query)
+    if terms and meta_norm:
+        exact = 0
+        fuzzy = 0
+        for term in terms:
+            if term in meta_norm:
+                exact += 1
+        if chunk.get("unit_type") == "document_metadata" and exact < len(terms):
+            meta_terms = chunk.get("_metadata_terms") or _domain_terms_from_text(meta_norm)
+            for term in terms:
+                if term not in meta_norm and _fuzzy_contains_term(term, meta_terms):
+                    fuzzy += 1
+        bonus += min(0.08 * exact + 0.06 * fuzzy, 0.55)
+        if len(terms) >= 2 and exact + fuzzy >= max(2, len(terms) - 1):
+            bonus += 0.25
+
+    if chunk.get("unit_type") == "document_metadata" and bonus > 0:
+        bonus += 0.18
+    return bonus
+
+
 @lru_cache(maxsize=2)
 def load_domain_lexicon(index_path: str = str(INDEX_PATH)) -> frozenset[str]:
     index = load_index(Path(index_path))
@@ -717,7 +783,7 @@ def is_index_domain_query(query: str, index_path: str = str(INDEX_PATH)) -> bool
 def metadata_bonus(chunk: dict[str, Any], query: str) -> float:
     low = query.lower()
     hay = _chunk_text_for_ranking(chunk).lower()
-    bonus = 0.0
+    bonus = metadata_prefilter_bonus(chunk, query)
     family = str(chunk.get("family") or "")
     for hinted_family, hints in FAMILY_HINTS.items():
         if family == hinted_family and any(hint in low for hint in hints):
@@ -746,8 +812,10 @@ def retrieve(index: dict[str, Any], query: str, top_k: int = 8, pool: int = 180)
     char_scores = linear_kernel(index["char_vectorizer"].transform([normalized]), index["char_matrix"]).ravel()
     bm25_scores = _bm25_scores(index, normalized)
     scores = 0.48 * word_scores + 0.25 * char_scores + 0.27 * bm25_scores
+    metadata_scores = np.fromiter((metadata_prefilter_bonus(chunk, query) for chunk in chunks), dtype=float, count=len(chunks))
+    candidate_scores = scores + metadata_scores
     pool_size = min(max(pool, top_k * 6), len(chunks))
-    candidate_idx = np.argpartition(scores, -pool_size)[-pool_size:]
+    candidate_idx = np.argpartition(candidate_scores, -pool_size)[-pool_size:]
     ranked = sorted(candidate_idx, key=lambda idx: scores[idx] + metadata_bonus(chunks[idx], query), reverse=True)
     hits: list[Hit] = []
     for rank, idx in enumerate(ranked[:top_k], start=1):
@@ -879,6 +947,8 @@ def infer_question_intent(query: str, chat_history: list[dict[str, str]] | None 
         return "flow"
     if any(term in low for term in ["impacto", "impact", "cambia", "change", "cr ", "change request"]):
         return "impact"
+    if any(term in low for term in ["lista", "listado", "list ", "list of", "documento", "document", "donde esta", "dónde está", "where is"]):
+        return "document_lookup"
     if any(term in low for term in ["resumen", "summary", "sintetiza"]):
         return "summary"
     if chat_history and any(term in low for term in ["y ", "entonces", "mas", "más", "tambien", "también", "eso", "este", "esta"]):
@@ -985,6 +1055,98 @@ def build_synthetic_answer(query: str, hits: list[Hit], language: str = "es") ->
     return {"answer": answer, "citations": citations, "confidence": confidence, "answer_type": f"synthetic_{intent}"}
 
 
+def _release_rank(release: str) -> int:
+    match = re.search(r"R(20\d{2})[._ -]?(MAR|JUN|OCT|NOV)", release or "", re.I)
+    if not match:
+        return 0
+    month_rank = {"MAR": 3, "JUN": 6, "OCT": 10, "NOV": 11}
+    return int(match.group(1)) * 100 + month_rank.get(match.group(2).upper(), 0)
+
+
+def _document_lookup_score(query: str, hit: Hit) -> float:
+    chunk = hit.chunk
+    low = query.lower()
+    title = str(chunk.get("title") or "").lower()
+    score = hit.score + metadata_prefilter_bonus(chunk, query)
+    if chunk.get("unit_type") == "document_metadata":
+        score += 0.35
+    if chunk.get("release") and chunk.get("release") == query_release(query):
+        score += 0.25
+    release_rank = _release_rank(str(chunk.get("release") or ""))
+    if release_rank:
+        score += 0.35 + min(release_rank / 250000.0, 0.12)
+    if chunk.get("category") == "releases":
+        score += 0.25
+    if title == "english":
+        score -= 0.2
+    if "updates of" in title and "update" not in low and "updates" not in low:
+        score -= 0.25
+    if title.startswith("annex ") and not re.search(r"\b(annex|anexo|attachment|adjunto)\b", low):
+        score -= 0.12
+    return score
+
+
+def build_document_lookup_answer(query: str, hits: list[Hit], language: str = "es") -> dict[str, Any] | None:
+    if not hits:
+        return None
+    intent = infer_question_intent(query)
+    ranked = sorted(hits, key=lambda hit: _document_lookup_score(query, hit), reverse=True)
+    best = ranked[0]
+    best_score = _document_lookup_score(query, best)
+    query_norm = _normalize_easter_text(query)
+    title_norm = _normalize_easter_text(str(best.chunk.get("title") or ""))
+    exact_title_lookup = (
+        best.chunk.get("unit_type") == "document_metadata"
+        and title_norm
+        and (title_norm == query_norm or title_norm in query_norm or query_norm in title_norm)
+        and best_score >= 1.5
+    )
+    if intent != "document_lookup" and not exact_title_lookup:
+        return None
+    if best_score < 0.45:
+        return None
+
+    doc = best.chunk
+    related = []
+    seen_docs: set[str] = set()
+    for hit in ranked:
+        doc_id = str(hit.chunk.get("doc_id") or "")
+        if doc_id and doc_id not in seen_docs:
+            related.append(hit)
+            seen_docs.add(doc_id)
+        if len(related) >= 4:
+            break
+    citations = citations_from_hits(related)
+
+    title = doc.get("title") or "Untitled"
+    release = doc.get("release") or ""
+    family = doc.get("family") or ""
+    context_path = doc.get("context_path") or []
+    context = " > ".join(context_path) if isinstance(context_path, list) else str(context_path or "")
+    source = doc.get("source_url") or ""
+    local_path = doc.get("local_path") or ""
+    release_part = f" ({release})" if release else ""
+
+    if language == "en":
+        answer = (
+            f"The right reference is `{title}`{release_part}.\n\n"
+            f"- **What it is:** a T2S document/list indexed as `{family or 'general'}`.\n"
+            f"- **Where it sits:** {context or 'the ECB T2S professional-use document set'}.\n"
+            f"- **Official source:** {source}\n"
+            f"- **Local indexed file:** `{local_path}`"
+        )
+    else:
+        answer = (
+            f"La referencia correcta es `{title}`{release_part}.\n\n"
+            f"- **Que es:** un documento/listado T2S indexado como `{family or 'general'}`.\n"
+            f"- **Donde encaja:** {context or 'el conjunto ECB T2S professional use'}.\n"
+            f"- **Fuente oficial:** {source}\n"
+            f"- **Fichero local indexado:** `{local_path}`"
+        )
+    answer += source_block(citations, language)
+    return {"answer": answer, "citations": citations, "confidence": "high", "answer_type": "document_lookup"}
+
+
 def _message_definition_key(code: str) -> str:
     parts = code.lower().split(".")
     return ".".join(parts[:2]) if len(parts) >= 2 else code.lower()
@@ -1085,6 +1247,9 @@ def build_answer(query: str, hits: list[Hit], language: str = "es", corpus_domai
     term_answer = build_term_answer(query, hits, language=language)
     if term_answer:
         return term_answer
+    document_answer = build_document_lookup_answer(query, hits, language=language)
+    if document_answer:
+        return document_answer
     return build_synthetic_answer(query, hits, language=language)
 
 

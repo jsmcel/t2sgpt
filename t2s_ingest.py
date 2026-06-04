@@ -8,6 +8,7 @@ import os
 import pickle
 import re
 import sys
+import tempfile
 import time
 import zipfile
 from dataclasses import dataclass, field
@@ -53,6 +54,10 @@ TEXT_EXTENSIONS = {
     ".yaml",
     ".yml",
 }
+SUPPORTED_ZIP_MEMBER_EXTENSIONS = TEXT_EXTENSIONS | {".pdf", ".xlsx", ".zip"}
+MAX_ZIP_MEMBER_BYTES = int(os.environ.get("T2S_ZIP_MEMBER_MAX_BYTES", str(80 * 1024 * 1024)))
+MAX_ZIP_MEMBERS_EXTRACTED = int(os.environ.get("T2S_ZIP_MEMBER_MAX_COUNT", "120"))
+XLSX_UNIT_MAX_CHARS = int(os.environ.get("T2S_XLSX_UNIT_MAX_CHARS", "1600"))
 
 
 def utc_now() -> str:
@@ -472,19 +477,70 @@ def extract_html(path: Path) -> list[dict]:
     return [{"unit_type": "html", "unit": 1, "text": text}] if text else []
 
 
+def _cell_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("\n", " ").strip()
+
+
 def extract_xlsx(path: Path) -> list[dict]:
     wb = load_workbook(path, read_only=True, data_only=True)
     units: list[dict] = []
     for ws in wb.worksheets:
-        lines = [f"Sheet: {ws.title}"]
+        header = ""
+        block_lines: list[str] = []
+        block_chars = 0
+        block_no = 1
+
+        def emit_block() -> None:
+            nonlocal block_lines, block_chars, block_no
+            if not block_lines:
+                return
+            prefix = f"Sheet: {ws.title}"
+            if header:
+                prefix += f"\nColumns: {header}"
+            text = clean_text(prefix + "\n" + "\n".join(block_lines))
+            if text:
+                units.append({"unit_type": "sheet", "unit": f"{ws.title} block {block_no}", "text": text})
+            block_lines = []
+            block_chars = 0
+            block_no += 1
+
+        row_no = 0
         for row in ws.iter_rows(values_only=True):
-            values = [str(value).strip() for value in row if value is not None and str(value).strip()]
+            values = []
+            for value in row:
+                cell = _cell_text(value)
+                if cell:
+                    values.append(cell)
             if values:
-                lines.append(" | ".join(values))
-        text = clean_text("\n".join(lines))
-        if text:
-            units.append({"unit_type": "sheet", "unit": ws.title, "text": text})
+                row_no += 1
+                line = " | ".join(values)
+                if not header:
+                    header = line
+                row_line = f"Row {row_no}: {line}"
+                if block_lines and block_chars + len(row_line) + len(header) + 32 > XLSX_UNIT_MAX_CHARS:
+                    emit_block()
+                block_lines.append(row_line)
+                block_chars += len(row_line) + 1
+        emit_block()
+    wb.close()
     return units
+
+
+def _extract_path_by_extension(path: Path, suffix: str) -> list[dict]:
+    if suffix == ".pdf":
+        return extract_pdf(path)
+    if suffix in {".html", ".htm"}:
+        return extract_html(path)
+    if suffix == ".xlsx":
+        return extract_xlsx(path)
+    if suffix == ".zip":
+        return extract_zip(path)
+    if suffix in TEXT_EXTENSIONS:
+        text = clean_text(path.read_text(encoding="utf-8", errors="ignore"))
+        return [{"unit_type": "file", "unit": 1, "text": text}] if text else []
+    return []
 
 
 def extract_zip(path: Path) -> list[dict]:
@@ -493,19 +549,52 @@ def extract_zip(path: Path) -> list[dict]:
         names = archive.namelist()
         inventory = "\n".join(names)
         units.append({"unit_type": "zip_inventory", "unit": 1, "text": f"ZIP inventory:\n{inventory}"})
-        for name in names:
-            suffix = Path(name).suffix.lower()
-            info = archive.getinfo(name)
-            if info.is_dir() or suffix not in TEXT_EXTENSIONS or info.file_size > 1024 * 1024:
-                continue
-            try:
-                raw = archive.read(name)
-                text = raw.decode("utf-8", errors="ignore")
-                text = clean_text(text)
-            except Exception:
-                continue
-            if text:
-                units.append({"unit_type": "zip_member", "unit": name, "text": f"ZIP member: {name}\n{text}"})
+        extracted_count = 0
+        with tempfile.TemporaryDirectory(prefix="t2s_zip_") as tmpdir:
+            tmp_root = Path(tmpdir)
+            for name in names:
+                suffix = Path(name).suffix.lower()
+                info = archive.getinfo(name)
+                if info.is_dir() or suffix not in SUPPORTED_ZIP_MEMBER_EXTENSIONS:
+                    continue
+                if info.file_size > MAX_ZIP_MEMBER_BYTES:
+                    units.append(
+                        {
+                            "unit_type": "zip_member_skipped",
+                            "unit": name,
+                            "text": f"ZIP member skipped because it is too large: {name} ({info.file_size} bytes)",
+                        }
+                    )
+                    continue
+                if extracted_count >= MAX_ZIP_MEMBERS_EXTRACTED:
+                    units.append(
+                        {
+                            "unit_type": "zip_member_skipped",
+                            "unit": name,
+                            "text": f"ZIP member skipped because archive extraction reached {MAX_ZIP_MEMBERS_EXTRACTED} supported members",
+                        }
+                    )
+                    continue
+                try:
+                    raw = archive.read(name)
+                    safe_name = safe_slug(Path(name.replace("\\", "/")).name or "member", 70)
+                    member_path = tmp_root / f"{extracted_count:04d}_{safe_name}{suffix}"
+                    member_path.write_bytes(raw)
+                    inner_units = _extract_path_by_extension(member_path, suffix)
+                except Exception as exc:
+                    units.append({"unit_type": "zip_member_error", "unit": name, "text": f"ZIP member extraction failed: {name} ({exc!r})"})
+                    continue
+                extracted_count += 1
+                for inner in inner_units:
+                    text = inner.get("text")
+                    if text:
+                        units.append(
+                            {
+                                "unit_type": f"zip_{inner.get('unit_type') or 'member'}",
+                                "unit": f"{name} :: {inner.get('unit')}",
+                                "text": f"ZIP member: {name}\n{text}",
+                            }
+                        )
     return units
 
 
@@ -575,16 +664,50 @@ def build_chunks(docs: list[Document], extracted: dict[str, list[dict]]) -> list
     for doc in docs:
         if doc.status != "downloaded":
             continue
+        context_path = []
+        for ctx in doc.contexts:
+            for item in ctx.get("path", []):
+                if item and item not in context_path:
+                    context_path.append(item)
+        metadata_text = clean_text(
+            "\n".join(
+                [
+                    f"Document title: {doc.title}",
+                    f"Document id: {doc.id}",
+                    f"Extension: {doc.ext}",
+                    f"Category: {doc.category}",
+                    f"Family: {doc.family}",
+                    f"Release: {doc.release}" if doc.release else "",
+                    f"Revision status: {doc.revision_status}" if doc.revision_status else "",
+                    f"Context path: {' > '.join(context_path)}" if context_path else "",
+                    f"Local path: {doc.local_path}",
+                    f"Source URL: {doc.url}",
+                ]
+            )
+        )
+        if metadata_text:
+            chunks.append(
+                {
+                    "chunk_id": f"{doc.id}:document_metadata:0:0",
+                    "doc_id": doc.id,
+                    "title": doc.title,
+                    "category": doc.category,
+                    "family": doc.family,
+                    "release": doc.release,
+                    "revision_status": doc.revision_status,
+                    "context_path": context_path,
+                    "unit_type": "document_metadata",
+                    "unit": 0,
+                    "text": metadata_text,
+                    "local_path": doc.local_path,
+                    "source_url": doc.url,
+                }
+            )
         units = extracted.get(doc.id, [])
         for unit in units:
             pieces = split_text(unit.get("text", ""))
             for idx, piece in enumerate(pieces):
                 chunk_id = f"{doc.id}:{unit.get('unit_type')}:{unit.get('unit')}:{idx}"
-                context_path = []
-                for ctx in doc.contexts:
-                    for item in ctx.get("path", []):
-                        if item and item not in context_path:
-                            context_path.append(item)
                 chunks.append(
                     {
                         "chunk_id": chunk_id,
@@ -635,6 +758,10 @@ def build_index(docs: list[Document], chunks: list[dict]) -> None:
                 chunk.get("schema_path", ""),
                 chunk.get("schema_target_namespace", ""),
                 chunk.get("mystandards_status", ""),
+                chunk.get("unit_type", ""),
+                str(chunk.get("unit", "")),
+                chunk.get("local_path", ""),
+                chunk.get("source_url", ""),
                 " > ".join(chunk.get("context_path", [])),
                 chunk.get("text", ""),
             ]

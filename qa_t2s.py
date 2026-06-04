@@ -62,6 +62,26 @@ QUESTIONS = [
         "must_not_contain_any": ["pasajes locales", "revisaria primero"],
         "min_citations": 1,
     },
+    {
+        "id": "document-business-rules-typo",
+        "question": "lista de buisness rules",
+        "must_contain_any": ["business rules r2026.jun"],
+        "must_not_contain_any": ["la referencia correcta es `annex a"],
+        "min_citations": 1,
+    },
+    {
+        "id": "document-business-rules-title",
+        "question": "Business rules R2026.JUN",
+        "must_contain_any": ["business rules r2026.jun"],
+        "min_citations": 1,
+    },
+    {
+        "id": "domain-gfs",
+        "question": "Que son las General Functional Specifications R2026.JUN?",
+        "must_contain_any": ["gfs", "general functional specifications"],
+        "must_not_contain_any": ["udfs es"],
+        "min_citations": 1,
+    },
 ]
 
 
