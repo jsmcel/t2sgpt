@@ -76,6 +76,18 @@ const ASK_START_TIMEOUT_MS = 20000;
 const ASK_POLL_TIMEOUT_MS = 12000;
 const ASK_POLL_INTERVAL_MS = 1200;
 const ASK_POLL_MAX_MISSES = 8;
+const JOB_STAGE_LABELS = {
+  queued: "en cola",
+  retrieving: "recuperando evidencia",
+  retrieving_context: "recuperando contexto",
+  synthesizing: "preparando dossier",
+  codex_generating: "Codex redactando",
+  codex_done: "Codex terminado",
+  context_ready: "contexto listo",
+  done: "completado",
+  error: "error",
+  cancelled: "cancelado",
+};
 
 function uid() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -125,6 +137,7 @@ function loadState() {
     if (saved?.chats?.length) {
       state.chats = saved.chats;
       state.activeId = saved.activeId || saved.chats[0].id;
+      sanitizeStoredPendingMessages();
       return;
     }
   } catch {
@@ -152,6 +165,20 @@ function loadState() {
   }
 
   createChat();
+}
+
+function sanitizeStoredPendingMessages() {
+  for (const chat of state.chats) {
+    for (const msg of chat.messages || []) {
+      if (!msg.pending) continue;
+      if (msg.jobId) {
+        msg.content = `Recuperando estado de produccion · job ${String(msg.jobId).slice(0, 8)}`;
+      } else {
+        msg.pending = false;
+        msg.content = "Consulta interrumpida antes de guardar el identificador del job. Pulsa Regenerar para lanzarla otra vez.";
+      }
+    }
+  }
 }
 
 function saveState() {
@@ -557,9 +584,16 @@ function visibleHistory(chat) {
     .map((item) => ({ role: item.role, content: item.content }));
 }
 
-function progressText(status, elapsedSeconds, misses = 0) {
+function progressText(status, elapsedSeconds, misses = 0, job = null) {
   if (misses > 0) {
     return `La respuesta sigue en marcha. Reintentando conexion con el servidor (${misses}/${ASK_POLL_MAX_MISSES})...`;
+  }
+  if (job?.server_alive) {
+    const stage = JOB_STAGE_LABELS[job.stage] || JOB_STAGE_LABELS[status] || status || "trabajando";
+    const pid = job.backend_pid ? ` · PID ${job.backend_pid}` : "";
+    const jobId = job.id ? ` · job ${String(job.id).slice(0, 8)}` : "";
+    const stageAge = Number.isFinite(Number(job.stage_elapsed_seconds)) ? ` · fase ${Math.round(Number(job.stage_elapsed_seconds))}s` : "";
+    return `Produccion viva${pid} · ${stage} · ${Math.round(elapsedSeconds)}s${stageAge}${jobId}`;
   }
   if (status === "queued") return "Consulta en cola...";
   if (elapsedSeconds > 90) return "Codex sigue trabajando con el contexto recuperado. Esto puede tardar un poco en preguntas largas...";
@@ -589,6 +623,19 @@ async function askWithJob(payload, pending, chat, signal) {
   });
   if (!start.job_id) throw new Error("El servidor no ha devuelto identificador de trabajo");
   state.activeJobId = start.job_id;
+  pending.jobId = start.job_id;
+  pending.content = progressText("queued", 0, 0, {
+    id: start.job_id,
+    status: start.status || "queued",
+    stage: start.stage || "queued",
+    server_alive: true,
+    backend_pid: start.backend_pid,
+    backend_uptime_seconds: start.backend_uptime_seconds,
+    stage_elapsed_seconds: 0,
+  });
+  chat.updatedAt = nowIso();
+  saveState();
+  renderAll();
 
   let misses = 0;
   while (true) {
@@ -605,7 +652,7 @@ async function askWithJob(payload, pending, chat, signal) {
       if (job.status === "done") return job.result || {};
       if (job.status === "error") throw new Error(job.error || "La consulta ha fallado en el servidor");
       if (job.status === "cancelled") throw abortError();
-      pending.content = progressText(job.status, elapsedSeconds);
+      pending.content = progressText(job.status, elapsedSeconds, 0, job);
       chat.updatedAt = nowIso();
       saveState();
       renderAll();
@@ -620,6 +667,82 @@ async function askWithJob(payload, pending, chat, signal) {
       saveState();
       renderAll();
     }
+  }
+}
+
+function applyAnswerData(data, pending, chat, mode, modelLabel) {
+  pending.pending = false;
+  pending.jobId = null;
+  if (mode === "context") {
+    pending.content = JSON.stringify(data, null, 2);
+    chat.refs = data.evidence || [];
+    chat.engine = "Contexto local";
+  } else {
+    pending.content = data.answer || "No se ha recibido respuesta.";
+    chat.refs = data.citations || [];
+    chat.engine = data.generated_by === "structured" ? "Respuesta estructurada" : modelLabel;
+  }
+  chat.updatedAt = nowIso();
+  state.scrollIntent = "assistant-start";
+}
+
+async function pollExistingJob(jobId, pending, chat, mode, modelLabel, signal) {
+  const startedAt = pending.createdAt ? new Date(pending.createdAt).getTime() : Date.now();
+  let misses = 0;
+  while (true) {
+    await sleep(ASK_POLL_INTERVAL_MS, signal);
+    const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
+    try {
+      const job = await fetchJson(`/ask/jobs/${encodeURIComponent(jobId)}`, {
+        signal,
+        timeout: ASK_POLL_TIMEOUT_MS,
+        retries: 1,
+        retryDelay: 400,
+      });
+      misses = 0;
+      if (job.status === "done") return job.result || {};
+      if (job.status === "error") throw new Error(job.error || "La consulta ha fallado en el servidor");
+      if (job.status === "cancelled") throw abortError();
+      pending.content = progressText(job.status, elapsedSeconds, 0, job);
+      chat.updatedAt = nowIso();
+      saveState();
+      renderAll();
+    } catch (err) {
+      if (err.name === "AbortError" || signal?.aborted) throw abortError();
+      misses += 1;
+      if (misses >= ASK_POLL_MAX_MISSES) throw err;
+      pending.content = progressText("running", elapsedSeconds, misses);
+      chat.updatedAt = nowIso();
+      saveState();
+      renderAll();
+    }
+  }
+}
+
+async function resumePendingJobIfAny() {
+  if (state.busy) return;
+  const chat = activeChat();
+  const pending = chat?.messages?.find((msg) => msg.pending && msg.jobId);
+  if (!chat || !pending) return;
+  setBusy(true);
+  state.aborter = new AbortController();
+  state.activeJobId = pending.jobId;
+  try {
+    const data = await pollExistingJob(pending.jobId, pending, chat, pending.mode || state.mode, pending.modelLabel || chat.engine || currentEngineLabel(), state.aborter.signal);
+    applyAnswerData(data, pending, chat, pending.mode || state.mode, pending.modelLabel || chat.engine || currentEngineLabel());
+  } catch (err) {
+    pending.pending = false;
+    pending.jobId = null;
+    const detail = friendlyErrorMessage(err);
+    pending.content = err.name === "AbortError" ? "Respuesta cancelada." : `No he podido recuperar el job de produccion.\n\nDetalle: ${detail}\n\nPulsa Regenerar para lanzarlo de nuevo.`;
+    chat.engine = err.name === "AbortError" ? "Cancelado" : "Error";
+    state.scrollIntent = "assistant-start";
+  } finally {
+    state.activeJobId = null;
+    state.aborter = null;
+    saveState();
+    renderAll();
+    setBusy(false);
   }
 }
 
@@ -642,6 +765,8 @@ async function submitQuestion(rawQuestion, options = {}) {
     content: state.mode === "context" ? "Recuperando contexto local..." : "Buscando evidencia y redactando...",
     pending: true,
     createdAt: nowIso(),
+    mode: state.mode,
+    modelLabel: currentEngineLabel(),
   };
   chat.messages.push(pending);
   chat.updatedAt = nowIso();
@@ -664,21 +789,10 @@ async function submitQuestion(rawQuestion, options = {}) {
       language: "auto",
     };
     const data = await askWithJob(payload, pending, chat, state.aborter.signal);
-
-    pending.pending = false;
-    if (state.mode === "context") {
-      pending.content = JSON.stringify(data, null, 2);
-      chat.refs = data.evidence || [];
-      chat.engine = "Contexto local";
-    } else {
-      pending.content = data.answer || "No se ha recibido respuesta.";
-      chat.refs = data.citations || [];
-      chat.engine = data.generated_by === "structured" ? "Respuesta estructurada" : currentEngineLabel();
-    }
-    chat.updatedAt = nowIso();
-    state.scrollIntent = "assistant-start";
+    applyAnswerData(data, pending, chat, state.mode, currentEngineLabel());
   } catch (err) {
     pending.pending = false;
+    pending.jobId = null;
     const detail = friendlyErrorMessage(err);
     pending.content = err.name === "AbortError"
       ? "Respuesta cancelada."
@@ -1104,6 +1218,7 @@ async function boot() {
   autoSize();
   if (await initAuth()) {
     loadManifest();
+    resumePendingJobIfAny();
     focusComposer();
   }
 }

@@ -16,7 +16,7 @@ import unicodedata
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from sklearn.metrics.pairwise import linear_kernel
@@ -1463,7 +1463,12 @@ def answer_question(
     retrieval_query: str | None = None,
     chat_history: list[dict[str, str]] | None = None,
     model_preset: str = "codex_high",
+    progress: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    def report(stage: str, **details: Any) -> None:
+        if progress:
+            progress(stage, details)
+
     resolved_language = detect_question_language(query) if language == "auto" else language
     if is_easter_egg_query(query):
         return {
@@ -1481,12 +1486,15 @@ def answer_question(
     if model_preset == "local_rag":
         generate = False
     corpus_domain = is_index_domain_query(query)
+    report("retrieving", generate=generate, model=model_preset)
     hits = _retrieve_context(search_query, top_k=top_k, generate=generate)
+    report("synthesizing", hits=len(hits), generate=generate, model=model_preset)
     payload = build_answer(query, hits, language=resolved_language, corpus_domain=corpus_domain)
     if generate and hits and payload.get("confidence") != "low":
         draft = payload.get("answer") or None
         generation_hits = prioritize_generation_hits(search_query, hits, max_hits=GENERATION_CONTEXT_HITS)
         try:
+            report("codex_generating", hits=len(generation_hits), model=model_preset)
             payload["answer"] = generate_with_codex(
                 query,
                 generation_hits,
@@ -1499,9 +1507,9 @@ def answer_question(
             payload["citations"] = citations_from_hits(generation_hits[: min(8, len(generation_hits))])
             payload["generated_by"] = MODEL_PRESETS.get(model_preset, MODEL_PRESETS["codex_high"])["label"].lower().replace(" ", "_")
             payload.pop("skip_generation", None)
+            report("codex_done", hits=len(generation_hits), model=model_preset)
         except Exception as exc:
-            payload["generated_by"] = "fallback_extractivo"
-            payload["generator_error"] = str(exc)
+            raise RuntimeError(f"Codex generation failed: {exc}") from exc
     elif payload.get("skip_generation"):
         payload["generated_by"] = "structured"
     elif model_preset == "local_rag":

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import smtplib
 import ssl
 import threading
@@ -38,7 +39,7 @@ from t2s_access import (
     valid_email,
     verify_password,
 )
-from t2s_ask import INDEX_PATH, MAX_CONTEXT_HITS, answer_question, augment_hits, build_codex_context, expand_neighbor_hits, load_index, load_json, rerank_context_hits, retrieve
+from t2s_ask import CODEX, INDEX_PATH, MAX_CONTEXT_HITS, answer_question, augment_hits, build_codex_context, expand_neighbor_hits, load_index, load_json, rerank_context_hits, retrieve
 
 
 ROOT = Path(__file__).resolve().parent
@@ -161,6 +162,7 @@ ASK_JOBS: dict[str, dict[str, Any]] = {}
 ASK_JOBS_LOCK = threading.Lock()
 ASK_JOB_TTL = int(os.environ.get("T2S_ASK_JOB_TTL", "3600"))
 INDEX_CACHE_MTIME = 0.0
+SERVER_STARTED_AT = time.time()
 
 
 def oauth_configured() -> bool:
@@ -659,7 +661,19 @@ def me(request: Request) -> dict[str, Any]:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": INDEX_PATH.exists(), "index": str(INDEX_PATH)}
+    with ASK_JOBS_LOCK:
+        active_jobs = sum(1 for job in ASK_JOBS.values() if job.get("status") not in {"done", "error", "cancelled"})
+    return {
+        "ok": INDEX_PATH.exists(),
+        "index": str(INDEX_PATH),
+        "pid": os.getpid(),
+        "uptime_seconds": round(time.time() - SERVER_STARTED_AT, 1),
+        "active_jobs": active_jobs,
+        "codex": {
+            "path": CODEX,
+            "available": Path(CODEX).exists() or bool(shutil.which(CODEX)),
+        },
+    }
 
 
 @app.get("/manifest")
@@ -687,17 +701,21 @@ def error_answer(req: AskRequest, exc: Exception) -> dict[str, Any]:
     }
 
 
-def answer_request(req: AskRequest) -> dict[str, Any]:
+def answer_request(req: AskRequest, progress: Any | None = None, raise_errors: bool = False) -> dict[str, Any]:
     try:
         ensure_current_rag_index()
         search_query = contextual_query(req.question, req.history)
         if req.mode == "context":
+            if progress:
+                progress("retrieving_context", {"model": req.model})
             index = load_index()
             retrieval_k = max(req.top_k, 32)
             hits = retrieve(index, search_query, top_k=retrieval_k)
             hits = augment_hits(index, search_query, hits)
             hits = expand_neighbor_hits(index, hits, max_neighbors=1, max_total=min(retrieval_k + 16, MAX_CONTEXT_HITS))
             hits = rerank_context_hits(search_query, hits, max_total=min(retrieval_k + 16, MAX_CONTEXT_HITS))
+            if progress:
+                progress("context_ready", {"hits": len(hits), "model": req.model})
             return build_codex_context(search_query, hits, max_hits=req.top_k)
         return answer_question(
             req.question,
@@ -707,8 +725,11 @@ def answer_request(req: AskRequest) -> dict[str, Any]:
             model_preset=req.model,
             retrieval_query=search_query,
             chat_history=history_for_model(req.history),
+            progress=progress,
         )
     except Exception as exc:
+        if raise_errors:
+            raise
         return error_answer(req, exc)
 
 
@@ -734,13 +755,29 @@ def ask_job_snapshot(job_id: str) -> dict[str, Any]:
         job = ASK_JOBS.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Ask job not found")
-        return {key: value for key, value in job.items() if key != "future"}
+        snapshot = {key: value for key, value in job.items() if key != "future"}
+    now = time.time()
+    created_at = float(snapshot.get("created_at") or now)
+    updated_at = float(snapshot.get("updated_at") or created_at)
+    snapshot.update(
+        {
+            "elapsed_seconds": round(now - created_at, 1),
+            "stage_elapsed_seconds": round(now - updated_at, 1),
+            "server_alive": True,
+            "backend_pid": os.getpid(),
+            "backend_uptime_seconds": round(now - SERVER_STARTED_AT, 1),
+        }
+    )
+    return snapshot
 
 
 def run_ask_job(job_id: str, req: AskRequest) -> None:
     set_ask_job(job_id, status="running", stage="retrieving")
     try:
-        result = answer_request(req)
+        def progress(stage: str, details: dict[str, Any]) -> None:
+            set_ask_job(job_id, status="running", stage=stage, stage_details=details)
+
+        result = answer_request(req, progress=progress, raise_errors=True)
         with ASK_JOBS_LOCK:
             job = ASK_JOBS.get(job_id)
             if not job:
@@ -779,7 +816,14 @@ def start_ask_job(req: AskRequest) -> dict[str, Any]:
     with ASK_JOBS_LOCK:
         if job_id in ASK_JOBS:
             ASK_JOBS[job_id]["future"] = future
-    return {"job_id": job_id, "status": "queued"}
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "stage": "queued",
+        "server_alive": True,
+        "backend_pid": os.getpid(),
+        "backend_uptime_seconds": round(time.time() - SERVER_STARTED_AT, 1),
+    }
 
 
 @app.get("/ask/jobs/{job_id}")
