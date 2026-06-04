@@ -629,6 +629,7 @@ async function submitQuestion(rawQuestion, options = {}) {
   if (!q) return;
 
   let chat = activeChat() || createChat();
+  const history = visibleHistory(chat);
   if (!options.regenerate) {
     chat.messages.push({ role: "user", content: q, createdAt: nowIso() });
     if (chat.messages.filter((m) => m.role === "user").length === 1) {
@@ -652,7 +653,6 @@ async function submitQuestion(rawQuestion, options = {}) {
   setBusy(true);
 
   state.aborter = new AbortController();
-  const history = visibleHistory(chat);
   try {
     const payload = {
       question: q,

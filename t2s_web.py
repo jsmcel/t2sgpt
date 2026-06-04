@@ -580,11 +580,15 @@ def history_for_model(history: list[ChatTurn]) -> list[dict[str, str]]:
 
 
 def contextual_query(question: str, history: list[ChatTurn]) -> str:
-    parts = [question.strip()]
+    question_text = question.strip()
+    question_norm = " ".join(question_text.lower().split())
+    parts = [question_text]
     recent = [
         f"{turn.role}: {turn.content.strip()}"
         for turn in history[-10:]
-        if turn.role in {"user", "assistant"} and turn.content.strip()
+        if turn.role in {"user", "assistant"}
+        and turn.content.strip()
+        and not (turn.role == "user" and " ".join(turn.content.strip().lower().split()) == question_norm)
     ]
     if recent:
         parts.append("Recent chat for resolving follow-up references:")
