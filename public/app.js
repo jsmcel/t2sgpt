@@ -580,8 +580,12 @@ function visibleHistory(chat) {
   return (chat?.messages || [])
     .filter((item) => item.role === "user" || item.role === "assistant")
     .filter((item) => !item.pending)
-    .slice(-10)
-    .map((item) => ({ role: item.role, content: item.content }));
+    .slice(-4)
+    .map((item) => ({
+      role: item.role,
+      content: String(item.content || "").replace(/\s+/g, " ").trim().slice(0, 600),
+    }))
+    .filter((item) => item.content);
 }
 
 function progressText(status, elapsedSeconds, misses = 0, job = null) {
@@ -593,7 +597,15 @@ function progressText(status, elapsedSeconds, misses = 0, job = null) {
     const pid = job.backend_pid ? ` · PID ${job.backend_pid}` : "";
     const jobId = job.id ? ` · job ${String(job.id).slice(0, 8)}` : "";
     const stageAge = Number.isFinite(Number(job.stage_elapsed_seconds)) ? ` · fase ${Math.round(Number(job.stage_elapsed_seconds))}s` : "";
-    return `Produccion viva${pid} · ${stage} · ${Math.round(elapsedSeconds)}s${stageAge}${jobId}`;
+    const diagnosis = job.progress_diagnosis || {};
+    const step = diagnosis.step ? ` · ${diagnosis.step}` : "";
+    const pct = Number.isFinite(Number(diagnosis.progress_pct)) ? ` ${Number(diagnosis.progress_pct).toFixed(1)}%` : "";
+    const eta = Number.isFinite(Number(diagnosis.eta_to_codex_seconds ?? diagnosis.eta_seconds))
+      ? ` · ETA Codex ${Math.max(0, Math.round(Number(diagnosis.eta_to_codex_seconds ?? diagnosis.eta_seconds)))}s`
+      : "";
+    const health = diagnosis.message ? ` · ${diagnosis.message}` : "";
+    const cpu = Number.isFinite(Number(diagnosis.cpu_rate)) ? ` · cpu ${Number(diagnosis.cpu_rate).toFixed(2)}s/s` : "";
+    return `Produccion viva${pid} · ${stage}${step}${pct} · ${Math.round(elapsedSeconds)}s${stageAge}${eta}${health}${cpu}${jobId}`;
   }
   if (status === "queued") return "Consulta en cola...";
   if (elapsedSeconds > 90) return "Codex sigue trabajando con el contexto recuperado. Esto puede tardar un poco en preguntas largas...";

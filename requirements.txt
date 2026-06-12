@@ -5,6 +5,7 @@ numpy
 openpyxl
 pypdf
 playwright
+psutil
 requests
 scikit-learn
 uvicorn

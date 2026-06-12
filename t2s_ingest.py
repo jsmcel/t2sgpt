@@ -32,6 +32,7 @@ RAW = DATA / "raw"
 RAW_DOCS = RAW / "documents"
 EXTRACTED = DATA / "extracted"
 PROCESSED = DATA / "processed"
+SUPPLEMENTAL_SOURCES_PATH = ROOT / "supplemental_sources.json"
 INDEX_URL = "https://www.ecb.europa.eu/paym/target/target-professional-use-documents-links/t2s/html/index.en.html"
 USER_AGENT = "Mozilla/5.0 (compatible; T2SLocalBot/1.0; +local-ingestion)"
 CR_PAGE_URL = "https://www.ecb.europa.eu/paym/target/t2s/governance/html/changerequests.en.html"
@@ -679,6 +680,7 @@ def build_chunks(docs: list[Document], extracted: dict[str, list[dict]]) -> list
                     f"Family: {doc.family}",
                     f"Release: {doc.release}" if doc.release else "",
                     f"Revision status: {doc.revision_status}" if doc.revision_status else "",
+                    f"Publishing date: {doc.publishing_date}" if doc.publishing_date else "",
                     f"Context path: {' > '.join(context_path)}" if context_path else "",
                     f"Local path: {doc.local_path}",
                     f"Source URL: {doc.url}",
@@ -695,6 +697,7 @@ def build_chunks(docs: list[Document], extracted: dict[str, list[dict]]) -> list
                     "family": doc.family,
                     "release": doc.release,
                     "revision_status": doc.revision_status,
+                    "publishing_date": doc.publishing_date,
                     "context_path": context_path,
                     "unit_type": "document_metadata",
                     "unit": 0,
@@ -717,6 +720,7 @@ def build_chunks(docs: list[Document], extracted: dict[str, list[dict]]) -> list
                         "family": doc.family,
                         "release": doc.release,
                         "revision_status": doc.revision_status,
+                        "publishing_date": doc.publishing_date,
                         "context_path": context_path,
                         "unit_type": unit.get("unit_type"),
                         "unit": unit.get("unit"),
@@ -758,6 +762,7 @@ def build_index(docs: list[Document], chunks: list[dict]) -> None:
                 chunk.get("schema_path", ""),
                 chunk.get("schema_target_namespace", ""),
                 chunk.get("mystandards_status", ""),
+                chunk.get("publishing_date", ""),
                 chunk.get("unit_type", ""),
                 str(chunk.get("unit", "")),
                 chunk.get("local_path", ""),
@@ -861,6 +866,197 @@ def rebuild_index_from_processed() -> dict:
     return json.loads((PROCESSED / "manifest.json").read_text(encoding="utf-8"))
 
 
+def load_supplemental_sources() -> list[dict]:
+    if not SUPPLEMENTAL_SOURCES_PATH.exists():
+        return []
+    data = json.loads(SUPPLEMENTAL_SOURCES_PATH.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError(f"{SUPPLEMENTAL_SOURCES_PATH} must contain a JSON list")
+    return [item for item in data if isinstance(item, dict) and item.get("url")]
+
+
+def supplemental_document(item: dict) -> Document:
+    url = normalize_url(str(item["url"]))
+    title = str(item.get("title") or Path(urlparse(url).path).stem or url).strip()
+    category = str(item.get("category") or "legal").strip() or "legal"
+    family = str(item.get("family") or "target_dkk").strip() or "target_dkk"
+    release = str(item.get("release") or "").strip()
+    publishing_date = str(item.get("publishing_date") or "").strip()
+    context_label = str(item.get("context") or "Supplemental authoritative sources").strip()
+    return Document(
+        id=sha1_text(url),
+        title=title,
+        url=url,
+        ext=url_extension(url),
+        category=category,
+        family=family,
+        release=release,
+        contexts=[{"h3": context_label, "accordion": [], "path": [context_label]}],
+        source_host=urlparse(url).netloc.lower(),
+        publishing_date=publishing_date,
+    )
+
+
+def append_supplemental_sources(force: bool = False) -> dict:
+    sources = load_supplemental_sources()
+    if not sources:
+        log("no supplemental sources configured")
+        return rebuild_index_from_processed()
+    documents_path = PROCESSED / "documents.json"
+    chunks_path = PROCESSED / "chunks.jsonl"
+    if not documents_path.exists() or not chunks_path.exists():
+        raise FileNotFoundError("Processed documents/chunks not found; run t2s_ingest.py first")
+
+    docs_payload = json.loads(documents_path.read_text(encoding="utf-8"))
+    docs = [Document(**doc) for doc in docs_payload]
+    chunks: list[dict] = []
+    with chunks_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                chunks.append(json.loads(line))
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
+    supplemental_docs = [supplemental_document(item) for item in sources]
+    supplemental_ids = {doc.id for doc in supplemental_docs}
+    supplemental_urls = {doc.url for doc in supplemental_docs}
+
+    docs = [doc for doc in docs if doc.id not in supplemental_ids and doc.url not in supplemental_urls]
+    chunks = [chunk for chunk in chunks if chunk.get("doc_id") not in supplemental_ids]
+
+    extracted: dict[str, list[dict]] = {}
+    downloaded: list[Document] = []
+    for idx, doc in enumerate(supplemental_docs, start=1):
+        log(f"downloading supplemental {idx}/{len(supplemental_docs)}: {doc.title[:90]}")
+        downloaded_doc = download_doc(session, doc, force=force)
+        downloaded.append(downloaded_doc)
+        if downloaded_doc.status == "downloaded":
+            log(f"extracting supplemental {idx}/{len(supplemental_docs)}: {downloaded_doc.title[:90]}")
+            extracted_doc, units = extract_text_for_doc(downloaded_doc)
+            extracted[extracted_doc.id] = units
+
+    docs.extend(downloaded)
+    chunks.extend(build_chunks(downloaded, extracted))
+    build_index(docs, chunks)
+    skipped_path = PROCESSED / "skipped_links.json"
+    skipped = json.loads(skipped_path.read_text(encoding="utf-8")) if skipped_path.exists() else []
+    write_catalog(docs, skipped)
+    manifest = json.loads((PROCESSED / "manifest.json").read_text(encoding="utf-8"))
+    log(f"supplemental done: {len(supplemental_docs)} sources, {manifest['chunks']} chunks")
+    return manifest
+
+
+def load_processed_documents_and_chunks() -> tuple[list[Document], list[dict]]:
+    documents_path = PROCESSED / "documents.json"
+    chunks_path = PROCESSED / "chunks.jsonl"
+    if not documents_path.exists() or not chunks_path.exists():
+        raise FileNotFoundError("Processed documents/chunks not found; run t2s_ingest.py first")
+    docs_payload = json.loads(documents_path.read_text(encoding="utf-8"))
+    docs = [Document(**doc) for doc in docs_payload]
+    chunks: list[dict] = []
+    with chunks_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                chunks.append(json.loads(line))
+    return docs, chunks
+
+
+def append_new_current_documents(max_pages: int = DEFAULT_MAX_PAGES, include_media: bool = False) -> dict:
+    docs, chunks = load_processed_documents_and_chunks()
+    existing_by_url = {doc.url: doc for doc in docs if doc.url}
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*", "Cache-Control": "no-cache"})
+    current_docs, skipped, crawled_pages = discover_professional_use_docs(
+        session,
+        force=True,
+        include_media=include_media,
+        max_pages=max_pages,
+    )
+    new_docs = [doc for doc in current_docs if doc.url not in existing_by_url]
+    changed_metadata = 0
+    for current in current_docs:
+        existing = existing_by_url.get(current.url)
+        if not existing:
+            continue
+        before = (
+            existing.title,
+            existing.category,
+            existing.family,
+            existing.release,
+            existing.revision_status,
+            existing.contexts,
+        )
+        existing.title = current.title
+        existing.category = current.category
+        existing.family = current.family
+        existing.release = current.release
+        existing.revision_status = current.revision_status
+        existing.contexts = current.contexts
+        after = (
+            existing.title,
+            existing.category,
+            existing.family,
+            existing.release,
+            existing.revision_status,
+            existing.contexts,
+        )
+        if before != after:
+            changed_metadata += 1
+
+    extracted: dict[str, list[dict]] = {}
+    downloaded: list[Document] = []
+    for idx, doc in enumerate(new_docs, start=1):
+        log(f"downloading new document {idx}/{len(new_docs)}: {doc.title[:90]}")
+        downloaded_doc = download_doc(session, doc, force=False)
+        downloaded.append(downloaded_doc)
+        if downloaded_doc.status == "downloaded":
+            log(f"extracting new document {idx}/{len(new_docs)}: {downloaded_doc.title[:90]}")
+            extracted_doc, units = extract_text_for_doc(downloaded_doc)
+            extracted[extracted_doc.id] = units
+
+    docs.extend(downloaded)
+    chunks.extend(build_chunks(downloaded, extracted))
+
+    supplemental_sources = load_supplemental_sources()
+    supplemental_docs = [supplemental_document(item) for item in supplemental_sources]
+    missing_supplemental = [doc for doc in supplemental_docs if doc.url not in {item.url for item in docs}]
+    if missing_supplemental:
+        log(f"adding {len(missing_supplemental)} missing supplemental sources")
+        supplemental_ids = {doc.id for doc in missing_supplemental}
+        supplemental_urls = {doc.url for doc in missing_supplemental}
+        docs = [doc for doc in docs if doc.id not in supplemental_ids and doc.url not in supplemental_urls]
+        chunks = [chunk for chunk in chunks if chunk.get("doc_id") not in supplemental_ids]
+        supplemental_extracted: dict[str, list[dict]] = {}
+        supplemental_downloaded: list[Document] = []
+        for idx, doc in enumerate(missing_supplemental, start=1):
+            log(f"downloading supplemental {idx}/{len(missing_supplemental)}: {doc.title[:90]}")
+            downloaded_doc = download_doc(session, doc, force=False)
+            supplemental_downloaded.append(downloaded_doc)
+            if downloaded_doc.status == "downloaded":
+                log(f"extracting supplemental {idx}/{len(missing_supplemental)}: {downloaded_doc.title[:90]}")
+                extracted_doc, units = extract_text_for_doc(downloaded_doc)
+                supplemental_extracted[extracted_doc.id] = units
+        docs.extend(supplemental_downloaded)
+        chunks.extend(build_chunks(supplemental_downloaded, supplemental_extracted))
+
+    if not new_docs and not missing_supplemental and not changed_metadata:
+        log("incremental sync: no new documents or listing metadata changes")
+    else:
+        log(
+            f"incremental sync: new={len(new_docs)}, missing_supplemental={len(missing_supplemental)}, "
+            f"metadata_updates={changed_metadata}"
+        )
+    build_index(docs, chunks)
+    write_catalog(docs, skipped)
+    (PROCESSED / "crawled_pages.json").write_text(json.dumps(crawled_pages, indent=2, ensure_ascii=False), encoding="utf-8")
+    manifest = json.loads((PROCESSED / "manifest.json").read_text(encoding="utf-8"))
+    log(f"incremental done: {manifest['documents_downloaded']} docs, {manifest['chunks']} chunks")
+    return manifest
+
+
 def write_catalog(docs: list[Document], skipped: list[dict]) -> None:
     lines = ["# T2S local catalog", "", f"Generated: {utc_now()}", "", "## Documents", ""]
     for doc in sorted(docs, key=lambda d: (d.category, d.release, d.family, d.title.lower())):
@@ -935,15 +1131,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-media", action="store_true", help="also download linked media files such as MP4")
     parser.add_argument("--limit", type=int, default=None, help="debug: ingest only first N documents")
     parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="maximum ECB professional-use HTML pages to crawl")
+    parser.add_argument("--supplemental-only", action="store_true", help="download configured supplemental sources and rebuild the index")
+    parser.add_argument("--incremental", action="store_true", help="discover current documentation and ingest only new URLs before rebuilding vectors")
     args = parser.parse_args(argv)
     try:
-        ingest(
-            force=args.force,
-            include_media=args.include_media,
-            limit=args.limit,
-            refresh_index=args.refresh_index,
-            max_pages=args.max_pages,
-        )
+        if args.incremental:
+            append_new_current_documents(max_pages=args.max_pages, include_media=args.include_media)
+        elif args.supplemental_only:
+            append_supplemental_sources(force=args.force)
+        else:
+            ingest(
+                force=args.force,
+                include_media=args.include_media,
+                limit=args.limit,
+                refresh_index=args.refresh_index,
+                max_pages=args.max_pages,
+            )
         return 0
     except KeyboardInterrupt:
         return 130

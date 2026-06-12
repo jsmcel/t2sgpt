@@ -167,7 +167,7 @@ def run_step(args: list[str]) -> dict[str, Any]:
     }
 
 
-def run_rebuild_pipeline() -> dict[str, Any]:
+def run_update_pipeline() -> dict[str, Any]:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup_dir = REPORT_DIR / f"processed-backup-{stamp}"
@@ -175,7 +175,7 @@ def run_rebuild_pipeline() -> dict[str, Any]:
         shutil.copytree(PROCESSED, backup_dir)
 
     steps = [
-        [sys.executable, "t2s_ingest.py", "--refresh-index"],
+        [sys.executable, "t2s_ingest.py", "--incremental"],
     ]
 
     results = []
@@ -262,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
     ingest_result: dict[str, Any] | None = None
     rebuild_status = "not_run"
     if rebuild_triggered:
-        ingest_result = run_rebuild_pipeline()
+        ingest_result = run_update_pipeline()
         rebuild_status = "ok" if ingest_result["returncode"] == 0 else "failed"
 
     state = {

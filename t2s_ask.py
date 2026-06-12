@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from dataclasses import dataclass
 from functools import lru_cache
@@ -33,6 +34,7 @@ MODEL_PRESETS = {
 GENERATION_CONTEXT_HITS = 24
 GENERATION_RETRIEVAL_HITS = 40
 MAX_CONTEXT_HITS = 64
+MAX_QUERY_METADATA_TERMS = int(os.environ.get("T2S_MAX_QUERY_METADATA_TERMS", "40"))
 DOMAIN_EVIDENCE_SCORE_THRESHOLD = 0.18
 RELEASE_RE = re.compile(r"R(20\d{2})[._ -]?(NOV|OCT|JUN|MAR)", re.I)
 MESSAGE_RE = re.compile(r"\b(acmt|admi|camt|pacs|reda|semt|sese|seev)\.(\d{3})(?:\.(\d{3}))?\b", re.I)
@@ -546,7 +548,11 @@ def is_domain_query(query: str) -> bool:
     return any(term in low for term in domain_terms) or any(acr in {"T2S", "CSD", "DCP", "DCA", "UDFS", "UHB", "GFS", "SDD"} for acr in query_acronyms(query))
 
 
-def _bm25_scores(index: dict[str, Any], query: str) -> np.ndarray:
+def _bm25_scores(
+    index: dict[str, Any],
+    query: str,
+    progress: Callable[[str, dict[str, Any]], None] | None = None,
+) -> np.ndarray:
     vectorizer = index.get("bm25_vectorizer")
     matrix = index.get("bm25_matrix")
     idf = index.get("bm25_idf")
@@ -560,13 +566,42 @@ def _bm25_scores(index: dict[str, Any], query: str) -> np.ndarray:
     k1 = 1.5
     b = 0.75
     scores = np.zeros(matrix.shape[0], dtype=float)
-    for term_idx in q.indices:
-        col = matrix[:, term_idx].tocoo()
+    column_matrix = index.get("bm25_matrix_csc")
+    if column_matrix is None:
+        column_matrix = matrix.tocsc()
+        index["bm25_matrix_csc"] = column_matrix
+    total_terms = len(q.indices)
+    for done, term_idx in enumerate(q.indices, start=1):
+        col = column_matrix[:, term_idx].tocoo()
         if col.nnz == 0:
+            if progress:
+                progress(
+                    "retrieving",
+                    {
+                        "step": "bm25",
+                        "items_done": done,
+                        "items_total": total_terms,
+                        "progress_pct": round(100 * done / max(total_terms, 1), 1),
+                        "term_idx": int(term_idx),
+                        "matches": 0,
+                    },
+                )
             continue
         freq = col.data.astype(float)
         denom = freq + k1 * (1 - b + b * (doc_len[col.row] / avgdl))
         scores[col.row] += idf[term_idx] * (freq * (k1 + 1) / denom)
+        if progress:
+            progress(
+                "retrieving",
+                {
+                    "step": "bm25",
+                    "items_done": done,
+                    "items_total": total_terms,
+                    "progress_pct": round(100 * done / max(total_terms, 1), 1),
+                    "term_idx": int(term_idx),
+                    "matches": int(col.nnz),
+                },
+            )
     max_score = float(scores.max() or 0.0)
     if max_score:
         scores = scores / max_score
@@ -601,6 +636,8 @@ def query_content_terms(query: str) -> list[str]:
             continue
         if term not in terms:
             terms.append(term)
+        if len(terms) >= MAX_QUERY_METADATA_TERMS:
+            break
     return terms
 
 
@@ -714,6 +751,8 @@ def metadata_prefilter_bonus(chunk: dict[str, Any], query: str) -> float:
     query_norm = _normalize_easter_text(query)
     meta_norm = str(chunk.get("_metadata_norm") or _normalize_easter_text(_metadata_text(chunk)))
     title_norm = str(chunk.get("_title_norm") or _normalize_easter_text(str(chunk.get("title") or "")))
+    source_norm = _normalize_easter_text(str(chunk.get("source_url") or ""))
+    local_norm = _normalize_easter_text(str(chunk.get("local_path") or ""))
     bonus = 0.0
 
     if title_norm and (title_norm == query_norm or title_norm in query_norm or query_norm in title_norm):
@@ -726,21 +765,23 @@ def metadata_prefilter_bonus(chunk: dict[str, Any], query: str) -> float:
     terms = query_content_terms(query)
     if terms and meta_norm:
         exact = 0
-        fuzzy = 0
         for term in terms:
             if term in meta_norm:
                 exact += 1
-        if chunk.get("unit_type") == "document_metadata" and exact < len(terms):
-            meta_terms = chunk.get("_metadata_terms") or _domain_terms_from_text(meta_norm)
-            for term in terms:
-                if term not in meta_norm and _fuzzy_contains_term(term, meta_terms):
-                    fuzzy += 1
-        bonus += min(0.08 * exact + 0.06 * fuzzy, 0.55)
-        if len(terms) >= 2 and exact + fuzzy >= max(2, len(terms) - 1):
+        bonus += min(0.08 * exact, 0.55)
+        if len(terms) >= 2 and exact >= max(2, len(terms) - 1):
             bonus += 0.25
 
     if chunk.get("unit_type") == "document_metadata" and bonus > 0:
         bonus += 0.18
+    if "dkk" in query_norm or "danish kroner" in query_norm or "danish krone" in query_norm:
+        current_hay = " ".join([meta_norm, title_norm, source_norm, local_norm])
+        if "target dkk" in current_hay or "nationalbanken.dk" in current_hay:
+            bonus += 0.45
+        if "decommissioning of kronos2" in current_hay or "migration to t2" in current_hay:
+            bonus += 0.35
+        if "kronos2" in current_hay and "decommission" not in current_hay and "migration" not in current_hay:
+            bonus -= 0.18
     return bonus
 
 
@@ -803,18 +844,50 @@ def metadata_bonus(chunk: dict[str, Any], query: str) -> float:
     return bonus
 
 
-def retrieve(index: dict[str, Any], query: str, top_k: int = 8, pool: int = 180) -> list[Hit]:
+def retrieve(
+    index: dict[str, Any],
+    query: str,
+    top_k: int = 8,
+    pool: int = 180,
+    progress: Callable[[str, dict[str, Any]], None] | None = None,
+) -> list[Hit]:
     chunks = index.get("chunks") or []
     if not chunks:
         return []
+    if progress:
+        progress("retrieving", {"step": "normalize_query", "query_chars": len(query), "chunks": len(chunks)})
     normalized = normalize_query(query)
+    if progress:
+        progress("retrieving", {"step": "word_vector", "query_chars": len(normalized), "chunks": len(chunks)})
     word_scores = linear_kernel(index["word_vectorizer"].transform([normalized]), index["word_matrix"]).ravel()
+    if progress:
+        progress("retrieving", {"step": "char_vector", "chunks": len(chunks)})
     char_scores = linear_kernel(index["char_vectorizer"].transform([normalized]), index["char_matrix"]).ravel()
-    bm25_scores = _bm25_scores(index, normalized)
+    if progress:
+        progress("retrieving", {"step": "bm25", "chunks": len(chunks)})
+    bm25_scores = _bm25_scores(index, normalized, progress=progress)
+    if progress:
+        progress("retrieving", {"step": "metadata_scoring", "chunks": len(chunks)})
     scores = 0.48 * word_scores + 0.25 * char_scores + 0.27 * bm25_scores
-    metadata_scores = np.fromiter((metadata_prefilter_bonus(chunk, query) for chunk in chunks), dtype=float, count=len(chunks))
+    metadata_values: list[float] = []
+    progress_stride = max(len(chunks) // 20, 1)
+    for pos, chunk in enumerate(chunks, start=1):
+        metadata_values.append(metadata_prefilter_bonus(chunk, query))
+        if progress and (pos == 1 or pos == len(chunks) or pos % progress_stride == 0):
+            progress(
+                "retrieving",
+                {
+                    "step": "metadata_scoring",
+                    "items_done": pos,
+                    "items_total": len(chunks),
+                    "progress_pct": round(100 * pos / max(len(chunks), 1), 1),
+                },
+            )
+    metadata_scores = np.asarray(metadata_values, dtype=float)
     candidate_scores = scores + metadata_scores
     pool_size = min(max(pool, top_k * 6), len(chunks))
+    if progress:
+        progress("retrieving", {"step": "candidate_ranking", "pool": pool_size, "top_k": top_k})
     candidate_idx = np.argpartition(candidate_scores, -pool_size)[-pool_size:]
     ranked = sorted(candidate_idx, key=lambda idx: scores[idx] + metadata_bonus(chunks[idx], query), reverse=True)
     hits: list[Hit] = []
@@ -937,6 +1010,36 @@ def source_block(citations: list[dict[str, Any]], language: str) -> str:
     return "\n\n" + title + ":\n" + "\n".join(f"[{c['n']}] {c['label']}" for c in citations)
 
 
+def _hit_text(hit: Hit) -> str:
+    chunk = hit.chunk
+    return " ".join(
+        str(chunk.get(key) or "")
+        for key in ("title", "family", "category", "release", "local_path", "source_url", "text")
+    ).lower()
+
+
+def _select_hits_by_keywords(hits: list[Hit], keyword_groups: list[tuple[str, ...]], max_items: int = 5) -> list[Hit]:
+    selected: list[Hit] = []
+    seen: set[str] = set()
+    for keywords in keyword_groups:
+        for hit in hits:
+            text = _hit_text(hit)
+            if all(keyword.lower() in text for keyword in keywords):
+                chunk_id = str(hit.chunk.get("chunk_id") or id(hit))
+                if chunk_id not in seen:
+                    selected.append(hit)
+                    seen.add(chunk_id)
+                break
+    for hit in hits:
+        if len(selected) >= max_items:
+            break
+        chunk_id = str(hit.chunk.get("chunk_id") or id(hit))
+        if chunk_id not in seen:
+            selected.append(hit)
+            seen.add(chunk_id)
+    return selected[:max_items]
+
+
 def infer_question_intent(query: str, chat_history: list[dict[str, str]] | None = None) -> str:
     low = query.lower()
     if any(term in low for term in ["que es", "qué es", "what is", "define", "defin"]):
@@ -1008,6 +1111,53 @@ def build_term_answer(query: str, hits: list[Hit], language: str = "es") -> dict
         )
     answer += source_block(citations, language)
     return {"answer": answer, "citations": citations, "confidence": "high", "answer_type": "term_definition"}
+
+
+def build_dkk_dca_answer(query: str, hits: list[Hit], language: str = "es") -> dict[str, Any] | None:
+    query_norm = _normalize_easter_text(query)
+    if not ("dkk" in query_norm and ("dca" in query_norm or "dedicated cash account" in query_norm)):
+        return None
+    citation_hits = _select_hits_by_keywords(
+        hits,
+        [
+            ("target dkk", "t2s dca"),
+            ("institutions authorised", "mca", "danish kroner"),
+            ("decommissioning of kronos2", "migration to t2"),
+            ("moved krone payments", "target services"),
+            ("danish krone", "all target services"),
+            ("t2s-0782", "decommissioning"),
+        ],
+        max_items=5,
+    )
+    citations = citations_from_hits(citation_hits)
+    if language == "en":
+        answer = (
+            "For a DKK cash account, do not route the answer through Kronos2 as an active platform. Kronos2 is legacy in this context: the relevant move is TARGET DKK/TARGET Services.\n\n"
+            "- You need a **T2S DCA denominated in DKK**.\n"
+            "- The operational precondition is normally a **DKK MCA / TARGET DKK relationship with Danmarks Nationalbank**, not merely being an entity with euro access.\n"
+            "- The DKK T2S DCA is opened on request to **Danmarks Nationalbank** using the TARGET registration process/forms.\n"
+            "- Liquidity management is handled in the TARGET Services setup: CLM/T2 matters for DKK liquidity and end-of-day/liquidity-transfer mechanics, but CLM is not a substitute for opening/configuring the DKK T2S DCA.\n"
+            "- If the entity only has EUR arrangements, the missing step is the DKK/TARGET DKK onboarding/account setup with the Danish central bank side; then link/configure the DKK T2S DCA for securities settlement.\n\n"
+            "Bottom line: open/request the **TARGET DKK/T2S DCA in DKK through Danmarks Nationalbank** and ensure the associated DKK MCA/liquidity setup. Do **not** answer this as 'use Kronos2'; Kronos2 appears in old/migration documents because it was decommissioned/replaced for this purpose."
+        )
+    else:
+        answer = (
+            "Para una DCA en DKK, no hay que llevar la respuesta por Kronos2 como si fuese el sistema operativo vigente. En este contexto Kronos2 es legacy: la via actual es **TARGET DKK / TARGET Services**.\n\n"
+            "- Necesitas una **T2S DCA denominada en DKK**.\n"
+            "- La condicion operativa normal es tener relacion/cuenta **MCA en DKK en TARGET DKK con Danmarks Nationalbank**, no simplemente ser una entidad con acceso en euros.\n"
+            "- La T2S DCA en DKK se abre a peticion ante **Danmarks Nationalbank** mediante el proceso/formulario de registro TARGET.\n"
+            "- CLM/T2 importa para la gestion de liquidez DKK y los mecanismos de transferencias/cierre, pero **CLM no sustituye** la apertura/configuracion de la DKK T2S DCA.\n"
+            "- Si la entidad solo tiene setup EUR, el gap es hacer onboarding/configuracion DKK/TARGET DKK con el banco central danes y despues vincular/configurar la T2S DCA DKK para liquidacion de valores.\n\n"
+            "Conclusion: pide/abre la **T2S DCA en DKK dentro de TARGET DKK con Danmarks Nationalbank** y asegura la MCA/setup de liquidez DKK asociado. No debe responderse como 'usa Kronos2': Kronos2 aparece en documentos antiguos/de migracion porque fue decommissioned/reemplazado para este flujo."
+        )
+    answer += source_block(citations, language)
+    return {
+        "answer": answer,
+        "citations": citations,
+        "confidence": "high",
+        "answer_type": "dkk_dca_current_state",
+        "skip_generation": True,
+    }
 
 
 def build_synthetic_answer(query: str, hits: list[Hit], language: str = "es") -> dict[str, Any]:
@@ -1241,6 +1391,9 @@ def build_answer(query: str, hits: list[Hit], language: str = "es", corpus_domai
     if not hits:
         msg = "I cannot find enough evidence in the local T2S index." if language == "en" else "No aparece evidencia suficiente en el indice local de T2S."
         return {"answer": msg, "citations": [], "confidence": "low"}
+    dkk_dca_answer = build_dkk_dca_answer(query, hits, language=language)
+    if dkk_dca_answer:
+        return dkk_dca_answer
     message_answer = build_message_answer(query, hits, language=language)
     if message_answer:
         return message_answer
@@ -1353,13 +1506,17 @@ def build_generation_prompt(
         "Analyse the user's intention before writing: if the user asks 'que es', define; if they ask for impact, explain impact; if they ask for a flow, sequence the process; if it is a follow-up, use the conversation to resolve what 'eso', 'este' or 'lo anterior' refers to. "
         "Do not answer as a document search result. The sources support the answer; they are not the answer. "
         "Keep the main answer concise and concrete unless the user asks for detail. Put sources only at the end, not inline inside the explanatory paragraphs. "
-        "Use official T2S names in English when the documents use them. If something is missing, say 'No aparece en la documentacion local recuperada'."
+        "Use official T2S names in English when the documents use them. If something is missing, say 'No aparece en la documentacion local recuperada'. "
+        "Temporal accuracy rule: change requests and migration documents can describe an old, interim or future state. Do not present them as current operational truth unless the evidence says so. "
+        "For DKK questions mentioning Kronos2, T2, CLM, TARGET DKK or DCA, treat Kronos2 as legacy/decommissioned unless the question explicitly asks for historical state; prefer TARGET DKK, Danmarks Nationalbank and current TARGET Services evidence."
         if language == "es"
         else "Write in English with a natural, direct technical-assistant voice. Start with the answer, then develop it. "
         "Analyse the user's intention before writing: if they ask what something is, define it; if they ask for impact, explain impact; if they ask for a flow, sequence the process; if it is a follow-up, use the conversation to resolve references. "
         "Do not answer as a document search result. The sources support the answer; they are not the answer. "
         "Keep the main answer concise and concrete unless the user asks for detail. Put sources only at the end, not inline inside explanatory paragraphs. "
-        "Use official T2S names. If something is missing, say 'I cannot find it in the retrieved local documentation'."
+        "Use official T2S names. If something is missing, say 'I cannot find it in the retrieved local documentation'. "
+        "Temporal accuracy rule: change requests and migration documents can describe an old, interim or future state. Do not present them as current operational truth unless the evidence says so. "
+        "For DKK questions mentioning Kronos2, T2, CLM, TARGET DKK or DCA, treat Kronos2 as legacy/decommissioned unless the question explicitly asks for historical state; prefer TARGET DKK, Danmarks Nationalbank and current TARGET Services evidence."
     )
     return f"""You are a senior T2S documentation assistant running inside a local T2S documentation repository.
 
@@ -1390,6 +1547,7 @@ def generate_with_codex(
     model_preset: str = "codex_high",
     draft_answer: str | None = None,
     context_query: str | None = None,
+    progress: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> str:
     if os.environ.get("T2S_DISABLE_CODEX", "").lower() in {"1", "true", "yes"}:
         raise RuntimeError("Codex generation disabled by T2S_DISABLE_CODEX")
@@ -1404,7 +1562,11 @@ def generate_with_codex(
         draft_answer=draft_answer,
         context_query=context_query,
     )
-    timeout = timeout or int(os.environ.get("T2S_CODEX_TIMEOUT", "180"))
+    if timeout is None:
+        timeout_raw = os.environ.get("T2S_CODEX_TIMEOUT", "").strip()
+        timeout = int(timeout_raw) if timeout_raw else None
+    if timeout is not None and timeout <= 0:
+        timeout = None
     preset = MODEL_PRESETS.get(model_preset, MODEL_PRESETS["codex_high"])
     reasoning = preset["reasoning"]
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
@@ -1427,10 +1589,87 @@ def generate_with_codex(
     model = os.environ.get("T2S_CODEX_MODEL", "").strip()
     if model:
         cmd[2:2] = ["-m", model]
+    started_at = time.monotonic()
+    report_every = max(float(os.environ.get("T2S_CODEX_PROGRESS_SECONDS", "5")), 1.0)
+    last_cpu_at = started_at
+    last_cpu = _process_tree_cpu_seconds(0)
+
+    def report_progress(process: subprocess.Popen[str], step: str) -> None:
+        nonlocal last_cpu, last_cpu_at
+        if not progress:
+            return
+        now = time.monotonic()
+        cpu_seconds = _process_tree_cpu_seconds(process.pid)
+        cpu_rate = None
+        if cpu_seconds is not None and last_cpu is not None:
+            cpu_rate = max(cpu_seconds - last_cpu, 0.0) / max(now - last_cpu_at, 0.001)
+        details: dict[str, Any] = {
+            "step": step,
+            "subprocess_pid": process.pid,
+            "elapsed_seconds": round(now - started_at, 1),
+            "timeout_seconds": timeout,
+            "timeout_enabled": timeout is not None,
+            "codex_alive": process.poll() is None,
+        }
+        if cpu_seconds is not None:
+            details["codex_cpu_seconds"] = round(cpu_seconds, 3)
+        if cpu_rate is not None:
+            details["codex_cpu_rate"] = round(cpu_rate, 3)
+        progress("codex_generating", details)
+        if cpu_seconds is not None:
+            last_cpu = cpu_seconds
+            last_cpu_at = now
+
+    def kill_process_tree(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            import psutil  # type: ignore[import-not-found]
+
+            parent = psutil.Process(process.pid)
+            for child in parent.children(recursive=True):
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+            parent.kill()
+        except Exception:
+            process.kill()
+
+    process = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(ROOT),
+    )
+    last_cpu = _process_tree_cpu_seconds(process.pid)
     try:
-        result = subprocess.run(cmd, input=prompt, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=timeout, cwd=str(ROOT), check=False)
-        if result.returncode != 0:
-            output = (result.stderr or result.stdout or "").strip()
+        report_progress(process, "codex_started")
+        communicate_input: str | None = prompt
+        while True:
+            elapsed = time.monotonic() - started_at
+            wait_for = report_every
+            if timeout is not None:
+                remaining = timeout - elapsed
+                if remaining <= 0:
+                    kill_process_tree(process)
+                    stdout, stderr = process.communicate()
+                    output = (stderr or stdout or "").strip()
+                    raise RuntimeError(f"codex generation exceeded {timeout}s and was stopped. {output}".strip())
+                wait_for = min(wait_for, max(remaining, 0.001))
+            try:
+                stdout, stderr = process.communicate(input=communicate_input, timeout=wait_for)
+                break
+            except subprocess.TimeoutExpired:
+                communicate_input = None
+                report_progress(process, "codex_running")
+        report_progress(process, "codex_exited")
+        if process.returncode != 0:
+            output = (stderr or stdout or "").strip()
             if len(output) > 1800:
                 output = output[:700] + "\n...\n" + output[-1000:]
             raise RuntimeError(output)
@@ -1438,6 +1677,13 @@ def generate_with_codex(
         if not answer:
             raise RuntimeError("codex returned an empty answer")
         return answer
+    except BaseException:
+        kill_process_tree(process)
+        try:
+            process.communicate(timeout=5)
+        except Exception:
+            pass
+        raise
     finally:
         try:
             output_path.unlink(missing_ok=True)
@@ -1445,13 +1691,52 @@ def generate_with_codex(
             pass
 
 
-def _retrieve_context(query: str, top_k: int, generate: bool) -> list[Hit]:
+def _process_tree_cpu_seconds(pid: int) -> float | None:
+    if pid <= 0:
+        return None
+    try:
+        import psutil  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    try:
+        process = psutil.Process(pid)
+        processes = [process, *process.children(recursive=True)]
+    except Exception:
+        return None
+    total = 0.0
+    seen: set[int] = set()
+    for item in processes:
+        try:
+            if item.pid in seen:
+                continue
+            seen.add(item.pid)
+            cpu = item.cpu_times()
+            total += float(cpu.user) + float(cpu.system)
+        except Exception:
+            continue
+    return total
+
+
+def _retrieve_context(
+    query: str,
+    top_k: int,
+    generate: bool,
+    progress: Callable[[str, dict[str, Any]], None] | None = None,
+) -> list[Hit]:
+    if progress:
+        progress("retrieving", {"step": "load_index", "query_chars": len(query), "generate": generate})
     index = load_index()
     retrieval_k = max(top_k, GENERATION_RETRIEVAL_HITS) if generate else top_k
-    hits = retrieve(index, query, top_k=retrieval_k)
+    hits = retrieve(index, query, top_k=retrieval_k, progress=progress)
+    if progress:
+        progress("retrieving", {"step": "augment_hits", "hits": len(hits)})
     hits = augment_hits(index, query, hits)
     max_context = max(retrieval_k + 16, top_k, GENERATION_CONTEXT_HITS if generate else top_k)
+    if progress:
+        progress("retrieving", {"step": "expand_neighbors", "hits": len(hits), "max_context": min(max_context, MAX_CONTEXT_HITS)})
     hits = expand_neighbor_hits(index, hits, max_neighbors=1, max_total=min(max_context, MAX_CONTEXT_HITS))
+    if progress:
+        progress("retrieving", {"step": "rerank_context", "hits": len(hits), "max_context": min(max_context, MAX_CONTEXT_HITS)})
     return rerank_context_hits(query, hits, max_total=min(max_context, MAX_CONTEXT_HITS))
 
 
@@ -1487,10 +1772,10 @@ def answer_question(
         generate = False
     corpus_domain = is_index_domain_query(query)
     report("retrieving", generate=generate, model=model_preset)
-    hits = _retrieve_context(search_query, top_k=top_k, generate=generate)
+    hits = _retrieve_context(search_query, top_k=top_k, generate=generate, progress=progress)
     report("synthesizing", hits=len(hits), generate=generate, model=model_preset)
     payload = build_answer(query, hits, language=resolved_language, corpus_domain=corpus_domain)
-    if generate and hits and payload.get("confidence") != "low":
+    if generate and hits and payload.get("confidence") != "low" and not payload.get("skip_generation"):
         draft = payload.get("answer") or None
         generation_hits = prioritize_generation_hits(search_query, hits, max_hits=GENERATION_CONTEXT_HITS)
         try:
@@ -1503,6 +1788,7 @@ def answer_question(
                 model_preset=model_preset,
                 draft_answer=draft,
                 context_query=search_query,
+                progress=progress,
             )
             payload["citations"] = citations_from_hits(generation_hits[: min(8, len(generation_hits))])
             payload["generated_by"] = MODEL_PRESETS.get(model_preset, MODEL_PRESETS["codex_high"])["label"].lower().replace(" ", "_")

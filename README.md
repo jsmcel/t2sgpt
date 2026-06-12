@@ -59,13 +59,21 @@ python access_admin.py approve usuario@example.com --name "Usuario"
 python access_admin.py list
 ```
 
-## Watcher
+## Watcher incremental
 
 ```powershell
 python t2s_doc_watcher.py --check-only --verbose
 ```
 
-El watcher compara el Professional Use actual con el corpus procesado y, si se ejecuta sin `--check-only`, reconstruye con `t2s_ingest.py --refresh-index`.
+El watcher compara el Professional Use actual con el corpus procesado y, si se ejecuta sin `--check-only`, llama a `t2s_ingest.py --incremental`: descarga y extrae solo URLs nuevas o fuentes suplementarias nuevas, y despues reconstruye los vectores del indice. No reextrae todo el corpus semanalmente.
+
+Para instalar la tarea semanal de Windows:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\setup_weekly_doc_watch_task.ps1
+```
+
+La tarea escribe logs en `output/t2s_doc_watch/` y deja un `scheduled-latest.log`.
 
 ## Publicacion
 

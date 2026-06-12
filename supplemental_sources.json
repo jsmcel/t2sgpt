@@ -1,0 +1,42 @@
+[
+  {
+    "title": "Terms and conditions for accounts in TARGET DKK",
+    "url": "https://www.nationalbanken.dk/media/vgmdtjre/terms-and-conditions-for-accounts-in-target-dkk-6-october-2025.pdf",
+    "category": "legal",
+    "family": "target_dkk",
+    "publishing_date": "2025-10-06",
+    "context": "TARGET DKK current account terms"
+  },
+  {
+    "title": "Danmarks Nationalbank has moved krone payments to the pan-european payment system",
+    "url": "https://www.nationalbanken.dk/en/news-and-knowledge/press/archive/2025/danmarks-nationalbank-has-moved-krone-payments-to-the-pan-european-payment-system-23-04-2025",
+    "category": "general",
+    "family": "target_dkk",
+    "publishing_date": "2025-04-23",
+    "context": "TARGET DKK current migration status"
+  },
+  {
+    "title": "Danish krone now available in all TARGET Services",
+    "url": "https://www.ecb.europa.eu/press/pr/date/2025/html/ecb.pr250423~096ce05219.en.html",
+    "category": "general",
+    "family": "target_dkk",
+    "publishing_date": "2025-04-23",
+    "context": "TARGET Services current DKK status"
+  },
+  {
+    "title": "Pricing model in TARGET DKK",
+    "url": "https://www.nationalbanken.dk/media/e2jfjxhe/pricing-model-in-target-dkk-march-2025-2623866-10.pdf",
+    "category": "pricing",
+    "family": "target_dkk",
+    "publishing_date": "2025-03-01",
+    "context": "TARGET DKK current pricing and Kronos2 replacement"
+  },
+  {
+    "title": "TARGET DKK memo",
+    "url": "https://www.nationalbanken.dk/media/fglhlz1i/target-dkk-memo-version-4-2024.pdf",
+    "category": "migration_and_testing",
+    "family": "target_dkk",
+    "publishing_date": "2024-12-01",
+    "context": "TARGET DKK migration design"
+  }
+]

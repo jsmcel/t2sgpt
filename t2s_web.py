@@ -163,6 +163,14 @@ ASK_JOBS_LOCK = threading.Lock()
 ASK_JOB_TTL = int(os.environ.get("T2S_ASK_JOB_TTL", "3600"))
 INDEX_CACHE_MTIME = 0.0
 SERVER_STARTED_AT = time.time()
+JOB_STALE_SECONDS = int(os.environ.get("T2S_JOB_STALE_SECONDS", "90"))
+JOB_STUCK_SECONDS = int(os.environ.get("T2S_JOB_STUCK_SECONDS", "240"))
+JOB_CPU_ACTIVE_RATE = float(os.environ.get("T2S_JOB_CPU_ACTIVE_RATE", "0.02"))
+JOB_TIMELINE_LIMIT = int(os.environ.get("T2S_JOB_TIMELINE_LIMIT", "80"))
+
+
+class AskJobCancelled(RuntimeError):
+    pass
 
 
 def oauth_configured() -> bool:
@@ -584,14 +592,40 @@ def history_for_model(history: list[ChatTurn]) -> list[dict[str, str]]:
 def contextual_query(question: str, history: list[ChatTurn]) -> str:
     question_text = question.strip()
     question_norm = " ".join(question_text.lower().split())
+    followup_markers = {
+        "eso",
+        "esa",
+        "ese",
+        "esto",
+        "esta",
+        "este",
+        "anterior",
+        "antes",
+        "mismo",
+        "misma",
+        "it",
+        "that",
+        "this",
+        "previous",
+        "same",
+    }
+    question_terms = set(question_norm.replace("?", " ").replace("¿", " ").split())
+    should_add_history = len(question_text) < 80 or bool(question_terms & followup_markers)
     parts = [question_text]
-    recent = [
-        f"{turn.role}: {turn.content.strip()}"
-        for turn in history[-10:]
-        if turn.role in {"user", "assistant"}
-        and turn.content.strip()
-        and not (turn.role == "user" and " ".join(turn.content.strip().lower().split()) == question_norm)
-    ]
+    recent: list[str] = []
+    if should_add_history:
+        for turn in history[-4:]:
+            content = turn.content.strip()
+            if (
+                turn.role not in {"user", "assistant"}
+                or not content
+                or (turn.role == "user" and " ".join(content.lower().split()) == question_norm)
+            ):
+                continue
+            content = " ".join(content.split())
+            if len(content) > 260:
+                content = content[:260].rsplit(" ", 1)[0] + "..."
+            recent.append(f"{turn.role}: {content}")
     if recent:
         parts.append("Recent chat for resolving follow-up references:")
         parts.extend(recent)
@@ -707,12 +741,18 @@ def answer_request(req: AskRequest, progress: Any | None = None, raise_errors: b
         search_query = contextual_query(req.question, req.history)
         if req.mode == "context":
             if progress:
-                progress("retrieving_context", {"model": req.model})
+                progress("retrieving_context", {"step": "load_index", "model": req.model})
             index = load_index()
             retrieval_k = max(req.top_k, 32)
-            hits = retrieve(index, search_query, top_k=retrieval_k)
+            hits = retrieve(index, search_query, top_k=retrieval_k, progress=progress)
+            if progress:
+                progress("retrieving_context", {"step": "augment_hits", "hits": len(hits), "model": req.model})
             hits = augment_hits(index, search_query, hits)
+            if progress:
+                progress("retrieving_context", {"step": "expand_neighbors", "hits": len(hits), "model": req.model})
             hits = expand_neighbor_hits(index, hits, max_neighbors=1, max_total=min(retrieval_k + 16, MAX_CONTEXT_HITS))
+            if progress:
+                progress("retrieving_context", {"step": "rerank_context", "hits": len(hits), "model": req.model})
             hits = rerank_context_hits(search_query, hits, max_total=min(retrieval_k + 16, MAX_CONTEXT_HITS))
             if progress:
                 progress("context_ready", {"hits": len(hits), "model": req.model})
@@ -746,8 +786,144 @@ def set_ask_job(job_id: str, **updates: Any) -> None:
         job = ASK_JOBS.get(job_id)
         if not job:
             return
+        now = time.time()
+        if job.get("status") == "cancelled" and updates.get("status") != "cancelled":
+            return
+        old_stage = job.get("stage")
+        old_details = job.get("stage_details")
+        old_step = old_details.get("step") if isinstance(old_details, dict) else None
+        new_details = updates.get("stage_details")
+        new_step = new_details.get("step") if isinstance(new_details, dict) else None
         job.update(updates)
-        job["updated_at"] = time.time()
+        if updates.get("stage") and updates.get("stage") != old_stage:
+            job["stage_started_at"] = now
+            job["step_started_at"] = now
+        elif new_step and new_step != old_step:
+            job["step_started_at"] = now
+        if any(key in updates for key in ("status", "stage", "stage_details", "result", "error")):
+            job["progress_updated_at"] = now
+            job["progress_cpu_seconds"] = time.process_time()
+            details = updates.get("stage_details")
+            timeline = job.setdefault("progress_timeline", [])
+            if isinstance(timeline, list):
+                event = {
+                    "ts": round(now - float(job.get("created_at") or now), 1),
+                    "stage": updates.get("stage") or job.get("stage"),
+                }
+                if isinstance(details, dict):
+                    for key in (
+                        "step",
+                        "items_done",
+                        "items_total",
+                        "progress_pct",
+                        "elapsed_seconds",
+                        "subprocess_pid",
+                        "codex_alive",
+                        "codex_cpu_rate",
+                    ):
+                        if key in details:
+                            event[key] = details[key]
+                timeline.append(event)
+                del timeline[:-JOB_TIMELINE_LIMIT]
+        job["updated_at"] = now
+
+
+def observe_job_progress(job: dict[str, Any], now: float) -> dict[str, Any]:
+    status = str(job.get("status") or "")
+    cpu_now = time.process_time()
+    previous_cpu = float(job.get("observed_cpu_seconds") or cpu_now)
+    previous_at = float(job.get("observed_at") or now)
+    wall_delta = max(now - previous_at, 0.001)
+    cpu_delta = max(cpu_now - previous_cpu, 0.0)
+    cpu_rate = cpu_delta / wall_delta
+    job["observed_cpu_seconds"] = cpu_now
+    job["observed_at"] = now
+
+    progress_at = float(job.get("progress_updated_at") or job.get("updated_at") or job.get("created_at") or now)
+    stage_at = float(job.get("stage_started_at") or progress_at)
+    step_at = float(job.get("step_started_at") or stage_at)
+    no_progress_seconds = max(now - progress_at, 0.0)
+    stage_seconds = max(now - stage_at, 0.0)
+    step_seconds = max(now - step_at, 0.0)
+    cpu_active = cpu_rate >= JOB_CPU_ACTIVE_RATE
+    step = ""
+    codex_alive = False
+    codex_pid = None
+    codex_elapsed_seconds = None
+    codex_cpu_rate = None
+    details = job.get("stage_details")
+    if isinstance(details, dict):
+        step = str(details.get("step") or "")
+        items_done = details.get("items_done")
+        items_total = details.get("items_total")
+        codex_alive = details.get("codex_alive") is True
+        codex_pid = details.get("subprocess_pid")
+        codex_elapsed_seconds = details.get("elapsed_seconds")
+        raw_codex_cpu_rate = details.get("codex_cpu_rate")
+        if isinstance(raw_codex_cpu_rate, (int, float)):
+            codex_cpu_rate = float(raw_codex_cpu_rate)
+            cpu_active = cpu_active or codex_cpu_rate >= JOB_CPU_ACTIVE_RATE
+
+    if status in {"done", "error", "cancelled"}:
+        state = "finished"
+        message = "finalizado"
+    elif codex_alive and codex_cpu_rate is not None and codex_cpu_rate >= JOB_CPU_ACTIVE_RATE:
+        state = "codex_cpu_active"
+        message = "Codex vivo y consume CPU"
+    elif codex_alive:
+        state = "codex_alive"
+        message = "Codex vivo; esperando salida"
+    elif no_progress_seconds >= JOB_STUCK_SECONDS and not cpu_active:
+        state = "stuck_no_cpu"
+        message = "posible atasco: sin CPU ni cambio de fase"
+    elif no_progress_seconds >= JOB_STUCK_SECONDS and cpu_active:
+        state = "long_running_cpu_active"
+        message = "largo, pero el proceso consume CPU"
+    elif no_progress_seconds >= JOB_STALE_SECONDS and not cpu_active:
+        state = "stale_no_cpu"
+        message = "sin cambio reciente; vigilando si se atasca"
+    elif no_progress_seconds >= JOB_STALE_SECONDS and cpu_active:
+        state = "long_running_cpu_active"
+        message = "fase larga con CPU activo"
+    else:
+        state = "progressing"
+        message = "progresando"
+
+    progress_pct = None
+    eta_seconds = None
+    eta_to_codex_seconds = None
+    if isinstance(details, dict):
+        raw_pct = details.get("progress_pct")
+        if isinstance(raw_pct, (int, float)):
+            progress_pct = float(raw_pct)
+        if isinstance(items_done, (int, float)) and isinstance(items_total, (int, float)) and items_done > 0 and items_total >= items_done:
+            step_elapsed = max(step_seconds, 0.001)
+            seconds_per_item = step_elapsed / float(items_done)
+            eta_seconds = max((float(items_total) - float(items_done)) * seconds_per_item, 0.0)
+            if step in {"word_vector", "char_vector", "bm25", "metadata_scoring", "candidate_ranking", "augment_hits", "expand_neighbors", "rerank_context"}:
+                eta_to_codex_seconds = eta_seconds
+
+    return {
+        "state": state,
+        "message": message,
+        "step": step,
+        "progress_pct": progress_pct,
+        "eta_seconds": round(eta_seconds, 1) if eta_seconds is not None else None,
+        "eta_to_codex_seconds": round(eta_to_codex_seconds, 1) if eta_to_codex_seconds is not None else None,
+        "cpu_active": cpu_active,
+        "cpu_seconds_since_last_poll": round(cpu_delta, 3),
+        "cpu_rate": round(cpu_rate, 3),
+        "process_cpu_seconds": round(cpu_now, 3),
+        "no_progress_seconds": round(no_progress_seconds, 1),
+        "stage_seconds": round(stage_seconds, 1),
+        "step_seconds": round(step_seconds, 1),
+        "stale_after_seconds": JOB_STALE_SECONDS,
+        "stuck_after_seconds": JOB_STUCK_SECONDS,
+        "codex_alive": codex_alive,
+        "codex_pid": codex_pid,
+        "codex_elapsed_seconds": codex_elapsed_seconds,
+        "codex_cpu_rate": codex_cpu_rate,
+    }
 
 
 def ask_job_snapshot(job_id: str) -> dict[str, Any]:
@@ -755,14 +931,18 @@ def ask_job_snapshot(job_id: str) -> dict[str, Any]:
         job = ASK_JOBS.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Ask job not found")
+        now = time.time()
+        diagnosis = observe_job_progress(job, now)
         snapshot = {key: value for key, value in job.items() if key != "future"}
-    now = time.time()
     created_at = float(snapshot.get("created_at") or now)
     updated_at = float(snapshot.get("updated_at") or created_at)
+    stage_started_at = float(snapshot.get("stage_started_at") or updated_at)
     snapshot.update(
         {
             "elapsed_seconds": round(now - created_at, 1),
-            "stage_elapsed_seconds": round(now - updated_at, 1),
+            "stage_elapsed_seconds": round(now - stage_started_at, 1),
+            "seconds_since_update": round(now - updated_at, 1),
+            "progress_diagnosis": diagnosis,
             "server_alive": True,
             "backend_pid": os.getpid(),
             "backend_uptime_seconds": round(now - SERVER_STARTED_AT, 1),
@@ -774,10 +954,19 @@ def ask_job_snapshot(job_id: str) -> dict[str, Any]:
 def run_ask_job(job_id: str, req: AskRequest) -> None:
     set_ask_job(job_id, status="running", stage="retrieving")
     try:
+        def ensure_not_cancelled() -> None:
+            with ASK_JOBS_LOCK:
+                job = ASK_JOBS.get(job_id)
+                if not job or job.get("status") == "cancelled":
+                    raise AskJobCancelled()
+
         def progress(stage: str, details: dict[str, Any]) -> None:
+            ensure_not_cancelled()
             set_ask_job(job_id, status="running", stage=stage, stage_details=details)
 
+        ensure_not_cancelled()
         result = answer_request(req, progress=progress, raise_errors=True)
+        ensure_not_cancelled()
         with ASK_JOBS_LOCK:
             job = ASK_JOBS.get(job_id)
             if not job:
@@ -785,6 +974,8 @@ def run_ask_job(job_id: str, req: AskRequest) -> None:
             if job.get("status") == "cancelled":
                 return
             job.update(status="done", stage="done", result=result, updated_at=time.time())
+    except AskJobCancelled:
+        set_ask_job(job_id, status="cancelled", stage="cancelled")
     except Exception as exc:
         set_ask_job(job_id, status="error", stage="error", error=str(exc), result=error_answer(req, exc))
 
@@ -794,6 +985,25 @@ def ask(req: AskRequest) -> dict[str, Any]:
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question is empty")
     return answer_request(req)
+
+
+@app.get("/ask/jobs")
+def list_ask_jobs() -> dict[str, Any]:
+    cleanup_ask_jobs()
+    with ASK_JOBS_LOCK:
+        job_ids = sorted(
+            ASK_JOBS,
+            key=lambda item: float(ASK_JOBS[item].get("created_at") or 0),
+            reverse=True,
+        )
+    jobs = [ask_job_snapshot(job_id) for job_id in job_ids[:25]]
+    return {
+        "jobs": jobs,
+        "active_jobs": sum(1 for job in jobs if job.get("status") not in {"done", "error", "cancelled"}),
+        "server_alive": True,
+        "backend_pid": os.getpid(),
+        "backend_uptime_seconds": round(time.time() - SERVER_STARTED_AT, 1),
+    }
 
 
 @app.post("/ask/jobs")
